@@ -270,6 +270,8 @@ def _layout_fit(
     direction: str | None,
     char_wrap: bool,
     preferred_lines: int,
+    comic_style: bool = False,
+    max_font_cap: int = 180,
 ) -> Tuple[List[FontEntry], List[str], List[Tuple[float, float, float, float]], int, int, int]:
     """
     Binary-search the largest font size that fits cleanly inside (box_w, box_h)
@@ -278,14 +280,16 @@ def _layout_fit(
     """
     min_size = 9
     max_size = max(min_size + 2, min(int(box_h * 0.98), int((box_h / max(1, preferred_lines)) * 1.65)))
-    max_size = min(max_size, 180)
+    max_size = min(max_size, max(min_size + 2, max_font_cap))
 
     best_result = None
     lo, hi = min_size, max_size
 
     while lo <= hi:
         mid = (lo + hi) // 2
-        font_chain = load_font_chain(text, target_lang, size=mid, bold=bold, meme_style=meme_style)
+        font_chain = load_font_chain(
+            text, target_lang, size=mid, bold=bold, meme_style=meme_style, comic_style=comic_style
+        )
         sw = max(1, int(round(mid * stroke_ratio))) if stroke_ratio > 0 else 0
         lines = _wrap_text(draw, text, font_chain, max(12, box_w), sw, direction, char_wrap)
 
@@ -303,7 +307,9 @@ def _layout_fit(
     if best_result is not None:
         return best_result
 
-    font_chain = load_font_chain(text, target_lang, size=min_size, bold=bold, meme_style=meme_style)
+    font_chain = load_font_chain(
+        text, target_lang, size=min_size, bold=bold, meme_style=meme_style, comic_style=comic_style
+    )
     sw = 1 if stroke_ratio > 0 else 0
     lines = _wrap_text(draw, text, font_chain, max(12, box_w), sw, direction, char_wrap)
     line_inks = [_measure_runs_ink(draw, ln, font_chain, sw, direction) for ln in lines]
@@ -370,12 +376,12 @@ def composite_and_render(
 
         # Choose target box:
         # For uniform speech bubbles / solid bars, use expanded bubble interior when helpful
-        # so multi-line or slightly longer translations sit comfortably centered inside the bubble!
+        # (always for vertical-to-horizontal manga bubbles so translated lines fill the oval!).
         x1, y1, x2, y2 = blk.bbox
         ex1, ey1, ex2, ey2 = blk.expanded_bbox
         len_ratio = len(render_text) / max(1, len(blk.source_text.strip()))
         has_expanded = (ex2 - ex1) > (x2 - x1) + 8 or (ey2 - ey1) > (y2 - y1) + 8
-        if style.uniform_bg and has_expanded and (len_ratio > 1.05 or blk.line_count >= 2):
+        if style.uniform_bg and has_expanded and (blk.is_vertical or len_ratio > 1.05 or blk.line_count >= 2):
             tx1, ty1, tx2, ty2 = ex1, ey1, ex2, ey2
         else:
             tx1, ty1, tx2, ty2 = x1, y1, x2, y2
@@ -426,18 +432,26 @@ def composite_and_render(
         text_layer = Image.new("RGBA", (patch_w, patch_h), (0, 0, 0, 0))
         draw = ImageDraw.Draw(text_layer)
 
+        # Keep font size natural on vertical-to-horizontal manga speech bubbles
+        # (prevents short words like "Huh?" from blowing up inside tall ovals without cramping full sentences)
+        max_font_cap = 180
+        if blk.is_vertical:
+            max_font_cap = max(36, min(64, int(min(box_w, box_h) * 0.26)))
+
         font_chain, lines, line_inks, line_gap, total_ink_h, sw = _layout_fit(
             draw=draw,
             text=render_text,
             target_lang=target_lang,
             box_w=box_w,
             box_h=box_h,
-            bold=style.is_bold,
+            bold=style.is_bold or (style.comic_style and script == "latin"),
             meme_style=meme_style,
             stroke_ratio=stroke_ratio,
             direction=direction,
             char_wrap=char_wrap,
-            preferred_lines=blk.line_count,
+            preferred_lines=1 if blk.is_vertical else blk.line_count,
+            comic_style=style.comic_style,
+            max_font_cap=max_font_cap,
         )
 
         # Sub-pixel vertical ink centering (subtract each line's actual ink_top!)

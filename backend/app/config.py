@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     cache_dir: Path = _BACKEND_DIR / ".cache"
     jobs_dir: Path = _BACKEND_DIR / ".cache" / "jobs"
     models_dir: Path = _BACKEND_DIR / ".cache" / "models"
+    fonts_dir: Path = _BACKEND_DIR / ".cache" / "fonts"
 
     # Ephemeral storage & batch limits
     job_ttl_seconds: int = 3600  # 1 hour default TTL
@@ -23,9 +24,19 @@ class Settings(BaseSettings):
     max_batch_images: int = 100
     worker_concurrency: int = 2
 
-    # Models (LaMa ONNX for local text erasure/inpainting)
+    # Models (local ONNX for comic/manga detection, Japanese manga OCR, and LaMa inpainting)
     lama_hf_repo: str = "Carve/LaMa-ONNX"
     lama_hf_filename: str = "lama_fp32.onnx"
+
+    comic_detector_hf_repo: str = "mayocream/comic-text-detector-onnx"
+    comic_detector_hf_filename: str = "comic-text-detector.onnx"
+    comic_detector_conf: float = 0.25
+    comic_detector_iou: float = 0.45
+
+    manga_ocr_hf_repo: str = "onnx-community/manga-ocr-base-ONNX"
+    manga_ocr_vocab_repo: str = "mayocream/manga-ocr-onnx"
+    manga_ocr_encoder_filename: str = "onnx/encoder_model_int8.onnx"
+    manga_ocr_decoder_filename: str = "onnx/decoder_model_int8.onnx"
 
     # Translation API configs
     default_translator: str = "google"  # deepseek | addis | google | deepl
@@ -56,3 +67,4 @@ settings = Settings()
 settings.cache_dir.mkdir(parents=True, exist_ok=True)
 settings.jobs_dir.mkdir(parents=True, exist_ok=True)
 settings.models_dir.mkdir(parents=True, exist_ok=True)
+settings.fonts_dir.mkdir(parents=True, exist_ok=True)

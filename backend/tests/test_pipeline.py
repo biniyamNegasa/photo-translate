@@ -186,7 +186,7 @@ def test_fastapi_batch_job_and_instant_rerender():
 
             # Wait for background worker to finish batch
             job = None
-            for _ in range(50):
+            for _ in range(180):
                 job = client.get(f"/api/jobs/{job_id}").json()
                 if job["status"] in ("completed", "failed"):
                     break
@@ -411,3 +411,119 @@ def test_balanced_line_wrapping():
     lines = _wrap_balanced_words(draw, ["WHAT", "ARE", "YOU", "DOING?"], chain, max_width=190, stroke_width=0, direction=None)
     assert len(lines) == 2
     assert lines == ["WHAT ARE", "YOU DOING?"]
+
+
+def test_comic_detector_postprocessing_and_manga_reading_order():
+    from app.pipeline.comic_detector import postprocess_comic_outputs
+
+    # Synthetic 800x600 image letterboxed at scale=1.28 into 1024x1024 (new_w=1024, new_h=768)
+    scale = 1024.0 / 800.0
+    new_w, new_h = 1024, 768
+
+    blk_raw = np.zeros((1, 4, 7), dtype=np.float32)
+    # Box 0: right-side vertical Japanese bubble (orig ~ 560..680, 100..340)
+    blk_raw[0, 0] = [620 * scale, 220 * scale, 120 * scale, 240 * scale, 0.92, 0.05, 0.95]
+    # Box 1: nested duplicate inside Box 0 (should be absorbed!)
+    blk_raw[0, 1] = [630 * scale, 210 * scale, 70 * scale, 180 * scale, 0.80, 0.05, 0.90]
+    # Box 2: left-side vertical bubble (orig ~ 100..220, 110..330)
+    blk_raw[0, 2] = [160 * scale, 220 * scale, 120 * scale, 220 * scale, 0.88, 0.05, 0.92]
+    # Box 3: false positive with no seg/det probability (should be filtered out!)
+    blk_raw[0, 3] = [400 * scale, 500 * scale, 100 * scale, 80 * scale, 0.70, 0.90, 0.05]
+
+    seg_raw = np.zeros((1, 1, 1024, 1024), dtype=np.float32)
+    det_raw = np.zeros((1, 2, 1024, 1024), dtype=np.float32)
+
+    # Paint vertical column probability inside both real bubbles
+    seg_raw[0, 0, int(120 * scale):int(320 * scale), int(580 * scale):int(660 * scale)] = 0.9
+    det_raw[0, 0, int(130 * scale):int(310 * scale), int(625 * scale):int(655 * scale)] = 0.9
+    det_raw[0, 0, int(140 * scale):int(290 * scale), int(585 * scale):int(610 * scale)] = 0.9
+
+    seg_raw[0, 0, int(130 * scale):int(310 * scale), int(120 * scale):int(200 * scale)] = 0.9
+    det_raw[0, 0, int(135 * scale):int(305 * scale), int(145 * scale):int(175 * scale)] = 0.9
+
+    regions = postprocess_comic_outputs(
+        blk_raw=blk_raw,
+        seg_raw=seg_raw,
+        det_raw=det_raw,
+        orig_shape=(600, 800),
+        scale=scale,
+        new_w=new_w,
+        new_h=new_h,
+        conf_thresh=0.25,
+        source_lang="ja",
+    )
+
+    assert len(regions) == 2
+    # Manga right-to-left reading order: right bubble MUST come first!
+    assert regions[0].bbox[0] > regions[1].bbox[0]
+    assert regions[0].is_vertical is True
+    assert regions[0].line_count == 2
+    assert regions[0].seg_mask is not None
+    assert int(np.count_nonzero(regions[0].seg_mask)) > 1000
+    # Left bubble's mask must NOT bleed into right bubble's mask
+    assert int(np.count_nonzero(regions[0].seg_mask[:, :300])) == 0
+
+
+def test_manga_ocr_preprocessing_and_token_decoding():
+    from app.pipeline.manga_ocr import decode_manga_tokens, preprocess_manga_crop
+
+    crop = np.full((80, 50, 3), 255, dtype=np.uint8)
+    tensor = preprocess_manga_crop(crop)
+    assert tensor.shape == (1, 3, 224, 224)
+    assert tensor.dtype == np.float32
+    assert float(tensor.min()) >= -1.01 and float(tensor.max()) <= 1.01
+
+    vocab = ["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]", "何", "し", "##て", "る", "の", "?", "!", "."]
+    decoded = decode_manga_tokens([2, 5, 6, 7, 8, 9, 10, 11, 12, 12, 12, 3], vocab)
+    assert decoded == "何してるの?!…"
+
+
+def test_end_to_end_japanese_manga_page_onnx():
+    from app.pipeline.comic_detector import comic_detector
+    from app.pipeline.manga_ocr import manga_ocr
+
+    if not (comic_detector.is_downloaded() and manga_ocr.is_downloaded()):
+        return
+
+    # Build a synthetic manga page with vertical Japanese bubble, horizontal English bubble & untouched art
+    img = Image.new("RGB", (800, 600), (225, 225, 225))
+    draw = ImageDraw.Draw(img)
+    # Untouched panel artwork in bottom center
+    draw.rectangle((310, 380, 490, 560), fill=(65, 95, 140), outline=(20, 20, 20), width=4)
+
+    # Vertical Japanese speech bubble (right)
+    draw.ellipse((490, 55, 750, 430), fill=(255, 255, 255), outline=(15, 15, 15), width=5)
+    jp_font = load_font("何してるの", "ja", size=38, bold=True)
+    for i, ch in enumerate("何してる"):
+        draw.text((645, 110 + i * 52), ch, font=jp_font, fill=(12, 12, 12))
+    for i, ch in enumerate("の？！"):
+        draw.text((580, 125 + i * 52), ch, font=jp_font, fill=(12, 12, 12))
+
+    # Horizontal English speech bubble (left)
+    draw.rounded_rectangle((55, 115, 365, 315), radius=45, fill=(255, 255, 255), outline=(15, 15, 15), width=5)
+    en_font = load_font("WAIT A SECOND!", "en", size=34, bold=True)
+    draw.text((100, 170), "WAIT A", font=en_font, fill=(12, 12, 12))
+    draw.text((100, 220), "SECOND!", font=en_font, fill=(12, 12, 12))
+
+    manga_rgb = np.array(img, dtype=np.uint8)
+
+    with patch("app.services.pipeline.translator_registry.get", return_value=MockTranslator()):
+        translated, _, _, blocks = process_image_pipeline(
+            image_rgb=manga_rgb,
+            source_lang="auto",
+            target_lang="en",
+            translator_id="mock",
+            use_lama=False,
+            use_comic_detector=True,
+        )
+
+    assert len(blocks) == 2
+    jp_blk = next((b for b in blocks if b.is_vertical), None)
+    assert jp_blk is not None
+    assert "何してるの" in jp_blk.source_text
+    assert jp_blk.source_lang == "ja"
+    assert jp_blk.style.comic_style is True
+    assert jp_blk.style.uniform_bg is True
+
+    # Untouched panel artwork must remain 100% bit-for-bit identical!
+    np.testing.assert_array_equal(translated[400:540, 330:470], manga_rgb[400:540, 330:470])

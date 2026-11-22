@@ -7,15 +7,16 @@ Upload a single image, multiple images, or a `.zip` batch — pick your target l
 ## Architecture
 
 - **Backend (`backend/`)**: Python **FastAPI** + async batch worker + SSE live progress
-  - **OCR & Block Grouping**: `rapidocr-onnxruntime` (ONNX PaddleOCR) with multi-line grouping for meme captions & speech bubbles
-  - **Tight Stroke Masking & Style Analysis**: Samples foreground color, meme stroke/outline, rotation angle, alignment, and uniform speech-bubble expansion bounds
-  - **Inpainting**: Patch-based full-resolution **LaMa ONNX** (`Carve/LaMa-ONNX`, auto-downloaded & cached in `backend/.cache/models/`)
+  - **Comic & Manga Detection (`comic-text-detector` ONNX)**: Speech-bubble block grouping, vertical/horizontal DBNet line orientation, manga right-to-left reading order, and **learned UNet pixel-exact ink segmentation masks** (running via OpenCV DNN on CPU in ~3s)
+  - **Specialized Manga + Multilingual OCR**: Pure-ONNX quantized **`manga-ocr`** (zero PyTorch) for vertical & stylized Japanese manga bubbles (automatically stripping furigana), paired with **`rapidocr-onnxruntime`** for English, Chinese, Korean, Arabic, Amharic, and general-image fallback
+  - **Stroke-Complete Masking & Style Analysis**: Fuses learned UNet ink masks with typography & speech-bubble interior geometry analysis
+  - **Hybrid Erasure / Inpainting**: Clean solid fill inside uniform speech bubbles + patch-based full-resolution **LaMa ONNX** (`Carve/LaMa-ONNX`) for screentones, halftones, memes, and photographic backgrounds
   - **Pluggable API Translation**:
     - `deepseek`: **DeepSeek API** context-aware batch translator — ideal for Japanese/Chinese → English comics & memes (`PHOTO_TRANSLATE_DEEPSEEK_API_KEY`)
     - `addis`: **Addis AI** adapter specialized for Amharic, Afaan Oromo, Tigrinya & English (`PHOTO_TRANSLATE_ADDIS_API_KEY`)
     - `google`: Zero-config **Google Translate** adapter (default fallback, no API key required)
     - `deepl`: **DeepL API** adapter (`PHOTO_TRANSLATE_DEEPL_API_KEY`)
-  - **Typography Rendering**: Pillow + **HarfBuzz/FriBidi (`libraqm`)** + Noto fonts for Latin, Ethiopic/Amharic, Arabic/Hebrew RTL, CJK, Cyrillic, Devanagari, Thai, etc.
+  - **Comic Lettering & Multilingual Rendering**: Auto-cached open-source **`Comic Neue`** lettering for comic/manga speech bubbles + Pillow + **HarfBuzz/FriBidi (`libraqm`)** + Noto fonts with multi-font `cmap` fallback for Ethiopic/Amharic, Arabic/Hebrew RTL, CJK, Cyrillic, Devanagari, Thai, etc.
   - **Ephemeral Storage**: Stateless temporary jobs with configurable TTL (`PHOTO_TRANSLATE_JOB_TTL_SECONDS`) and cached inpainted/mask layers for instant `<200ms` Advanced re-rendering.
 - **Frontend (`frontend/`)**: **[Farm.js](https://farmjs.dev/) (`@farm.js/core`) + React 19 (TypeScript)**
   - File-system `src/app/` routing with SSR + `"use client"` interactive studio
@@ -48,7 +49,7 @@ chmod +x start-dev.sh
 
 Open **http://localhost:3000** in your browser.
 
-> **First run note:** The LaMa ONNX inpainting model (~208 MB) is automatically downloaded into `backend/.cache/models/` on your first translation and cached locally.
+> **First run note:** Local ONNX models (`comic-text-detector` ~95 MB, quantized `manga-ocr` ~116 MB, and `LaMa` ~208 MB) plus the `Comic Neue` comic lettering font are automatically downloaded into `backend/.cache/` on first use and cached locally.
 
 ## Environment Variables (Optional)
 

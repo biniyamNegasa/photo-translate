@@ -33,8 +33,8 @@ def _find_speech_bubble_box(
     bh = max(1, y2 - y1)
 
     # Search window generously around bbox (clamped to image bounds)
-    margin_x = min(max(40, int(bw * max_expand_ratio)), 140)
-    margin_y = min(max(30, int(bh * max_expand_ratio)), 110)
+    margin_x = min(max(40, int(bw * max_expand_ratio)), 220 if max_expand_ratio > 0.6 else 140)
+    margin_y = min(max(30, int(bh * max_expand_ratio)), 140 if max_expand_ratio > 0.6 else 110)
     sx1 = max(0, x1 - margin_x)
     sy1 = max(0, y1 - margin_y)
     sx2 = min(w_img, x2 + margin_x)
@@ -143,13 +143,43 @@ def extract_block_mask_and_style(
         pts = np.array([[p[0] - rx1, p[1] - ry1] for p in line.polygon], dtype=np.int32)
         cv2.fillPoly(poly_mask, [pts], 255)
 
-    # Outer halo (6..16px beyond polygons — far enough outside thick meme outlines!) to sample true background
-    inner_r = max(7, int(min_line_h * 0.22) | 1)
-    outer_r = max(inner_r + 10, int(min_line_h * 0.55) | 1)
-    k_inner = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (inner_r, inner_r))
-    k_outer = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (outer_r, outer_r))
-    halo_mask = cv2.subtract(cv2.dilate(poly_mask, k_outer), cv2.dilate(poly_mask, k_inner))
-    halo_pixels = roi[halo_mask > 0]
+    # Check if comic-text-detector provided a learned UNet pixel ink segmentation mask for this block
+    learned_roi = None
+    if block.comic_seg_mask is not None and block.comic_seg_mask.shape[:2] == (h_img, w_img):
+        seg_slice = block.comic_seg_mask[ry1:ry2, rx1:rx2]
+        if int(np.count_nonzero(seg_slice)) >= 12:
+            learned_roi = ((seg_slice > 127).astype(np.uint8)) * 255
+            # Ensure poly_mask covers the full learned ink footprint (DBNet kernels can be shrunken)
+            poly_mask = cv2.bitwise_or(poly_mask, learned_roi)
+
+    # Sample true background pixels cleanly outside text strokes!
+    if learned_roi is not None:
+        # When we have the learned UNet ink mask, non-ink pixels inside & immediately around
+        # the block bbox give an uncontaminated reading of the speech bubble / background color!
+        bx_mask = np.zeros((rh, rw), dtype=np.uint8)
+        bx_pad = 6
+        cv2.rectangle(
+            bx_mask,
+            (max(0, (x1 - rx1) - bx_pad), max(0, (y1 - ry1) - bx_pad)),
+            (min(rw - 1, (x2 - rx1) + bx_pad), min(rh - 1, (y2 - ry1) + bx_pad)),
+            255,
+            thickness=-1,
+        )
+        k_ink = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+        ink_excl = cv2.dilate(learned_roi, k_ink)
+        halo_mask = cv2.subtract(bx_mask, ink_excl)
+        halo_pixels = roi[halo_mask > 0]
+    else:
+        halo_pixels = np.empty((0, 3), dtype=np.uint8)
+
+    if len(halo_pixels) < 20:
+        # Outer halo (6..16px beyond polygons — far enough outside thick meme outlines!) to sample true background
+        inner_r = max(7, int(min_line_h * 0.22) | 1)
+        outer_r = max(inner_r + 10, int(min_line_h * 0.55) | 1)
+        k_inner = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (inner_r, inner_r))
+        k_outer = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (outer_r, outer_r))
+        halo_mask = cv2.subtract(cv2.dilate(poly_mask, k_outer), cv2.dilate(poly_mask, k_inner))
+        halo_pixels = roi[halo_mask > 0]
     if len(halo_pixels) < 10:
         halo_pixels = roi[poly_mask == 0]
     if len(halo_pixels) == 0:
@@ -157,7 +187,7 @@ def extract_block_mask_and_style(
 
     bg_median = np.median(halo_pixels, axis=0)
     bg_std = float(np.mean(np.std(halo_pixels.astype(np.float32), axis=0)))
-    uniform_bg = bg_std < 20.0
+    uniform_bg = bg_std < 22.0
     bg_color = (int(bg_median[0]), int(bg_median[1]), int(bg_median[2]))
 
     # Compute color distance from local background across the whole ROI
@@ -250,11 +280,40 @@ def extract_block_mask_and_style(
             seed_labels = set(np.unique(cc_labels[poly_mask > 0])) - {0}
             clean_fg = np.isin(cc_labels, list(seed_labels)).astype(np.uint8) * 255 if seed_labels else raw_fg
 
-            k_dil = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-            char_mask = cv2.dilate(clean_fg, k_dil)
-            # Clamp strictly inside uniform bubble pixels + original polygon so borders stay crisp
-            bubble_safe = ((dist_map < 28.0) | (poly_mask > 0) | (clean_fg > 0)).astype(np.uint8) * 255
-            char_mask = cv2.bitwise_and(char_mask, bubble_safe)
+            if learned_roi is not None:
+                # Combine learned comic UNet ink segmentation with connected foreground strokes
+                # so furigana, thin kana, and exclamation marks are 100% erased inside the bubble.
+                combined_fg = cv2.bitwise_or(clean_fg, learned_roi)
+                k_dil = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+                char_mask = cv2.dilate(combined_fg, k_dil)
+                bubble_safe = ((dist_map < 30.0) | (poly_mask > 0) | (combined_fg > 0)).astype(np.uint8) * 255
+                char_mask = cv2.bitwise_and(char_mask, bubble_safe)
+            else:
+                k_dil = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+                char_mask = cv2.dilate(clean_fg, k_dil)
+                # Clamp strictly inside uniform bubble pixels + original polygon so borders stay crisp
+                bubble_safe = ((dist_map < 28.0) | (poly_mask > 0) | (clean_fg > 0)).astype(np.uint8) * 255
+                char_mask = cv2.bitwise_and(char_mask, bubble_safe)
+        elif learned_roi is not None:
+            # Screentones, comic panels, or textured comic artwork:
+            # Use the learned UNet pixel ink mask so LaMa ONLY inpaints actual text strokes
+            # (+ clean outline margin), preserving surrounding manga artwork & panel lines!
+            dil_px = (
+                max(11, min(19, int(round(min_line_h * 0.28)) | 1))
+                if has_stroke
+                else max(9, min(15, int(round(min_line_h * 0.20)) | 1))
+            )
+            k_seg = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dil_px, dil_px))
+            char_mask = cv2.dilate(learned_roi, k_seg)
+            if has_stroke:
+                fg_any = (dist_map > 26.0).astype(np.uint8) * 255
+                candidate = cv2.bitwise_and(fg_any, cv2.dilate(learned_roi, k_seg))
+                num_cc, cc_labels = cv2.connectedComponents(candidate, connectivity=8)
+                seed_labels = set(np.unique(cc_labels[learned_roi > 0])) - {0}
+                if seed_labels:
+                    stroke_cc = np.isin(cc_labels, list(seed_labels)).astype(np.uint8) * 255
+                    k_pad = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+                    char_mask = cv2.bitwise_or(char_mask, cv2.dilate(stroke_cc, k_pad))
         else:
             # Outlined meme text, drop shadows, or textured/photo background:
             # Dilate generously so thick black meme borders & drop shadows are 100% INSIDE the mask!
@@ -280,15 +339,19 @@ def extract_block_mask_and_style(
     alpha_chars = [ch for ch in block.text if ch.isalpha()]
     is_uppercase = len(alpha_chars) >= 3 and all(ch.isupper() for ch in alpha_chars)
 
-    # For uniform backgrounds (speech bubbles / solid bars), compute inscribed clean bubble bounds
+    # For uniform backgrounds (speech bubbles / solid bars), compute inscribed clean bubble bounds.
+    # Vertical manga bubbles expand generously horizontally so horizontal translations fill the oval!
+    expand_ratio = 0.85 if block.is_vertical else 0.45
     expanded_bbox = (
-        _find_speech_bubble_box(image_rgb, block.bbox, bg_color)
+        _find_speech_bubble_box(image_rgb, block.bbox, bg_color, max_expand_ratio=expand_ratio)
         if uniform_bg and abs(block.angle) < 3.0
         else block.bbox
     )
 
     full_mask = np.zeros((h_img, w_img), dtype=np.uint8)
     full_mask[ry1:ry2, rx1:rx2] = char_mask
+
+    comic_style = bool(block.is_comic_block and not (has_stroke and is_bold))
 
     style = TextStyle(
         fg_color=fg_color,
@@ -301,6 +364,7 @@ def extract_block_mask_and_style(
         angle=block.angle,
         alignment=block.alignment,
         uniform_bg=uniform_bg,
+        comic_style=comic_style,
     )
 
     return full_mask, style, expanded_bbox

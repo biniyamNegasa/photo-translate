@@ -32,6 +32,7 @@ class TextStyle(BaseModel):
     angle: float = 0.0
     alignment: str = "center"  # left | center | right
     uniform_bg: bool = False
+    comic_style: bool = False
 
 
 class TextBlock(BaseModel):
@@ -45,6 +46,7 @@ class TextBlock(BaseModel):
     confidence: float = 1.0
     enabled: bool = True
     line_count: int = 1
+    is_vertical: bool = False
     style: TextStyle = Field(default_factory=TextStyle)
 
 
@@ -103,6 +105,8 @@ class TranslatorInfo(BaseModel):
 
 class SystemStatus(BaseModel):
     lama_downloaded: bool
+    comic_detector_downloaded: bool = False
+    manga_ocr_downloaded: bool = False
     raqm_available: bool
     device: str
     translators: List[TranslatorInfo]

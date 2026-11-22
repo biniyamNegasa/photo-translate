@@ -7,9 +7,16 @@ from typing import Dict, FrozenSet, List, Optional, Tuple
 
 from PIL import ImageFont, features
 
+from app.config import settings
 from app.languages import detect_script, get_language
 
 logger = logging.getLogger(__name__)
+
+COMIC_FONT_URLS = {
+    "ComicNeue-Bold.ttf": "https://raw.githubusercontent.com/google/fonts/main/ofl/comicneue/ComicNeue-Bold.ttf",
+    "ComicNeue-Regular.ttf": "https://raw.githubusercontent.com/google/fonts/main/ofl/comicneue/ComicNeue-Regular.ttf",
+}
+_COMIC_FONT_DOWNLOAD_ATTEMPTED: set[str] = set()
 
 # Preferred font families per Unicode script (regular, bold)
 SCRIPT_FONT_FAMILIES: Dict[str, List[str]] = {
@@ -164,9 +171,47 @@ def _fc_match(pattern: str) -> Optional[str]:
     return None
 
 
+def _resolve_comic_font_path(bold: bool = True) -> Optional[str]:
+    """
+    Resolve cached open-source comic lettering font (`ComicNeue-Bold.ttf` / `ComicNeue-Regular.ttf`).
+    Attempts a one-time silent download into `settings.fonts_dir` if missing; falls back cleanly if offline.
+    """
+    fname = "ComicNeue-Bold.ttf" if bold else "ComicNeue-Regular.ttf"
+    target = settings.fonts_dir / fname
+    if target.is_file() and target.stat().st_size > 10_000:
+        return str(target)
+
+    if fname not in _COMIC_FONT_DOWNLOAD_ATTEMPTED:
+        _COMIC_FONT_DOWNLOAD_ATTEMPTED.add(fname)
+        url = COMIC_FONT_URLS.get(fname)
+        if url:
+            try:
+                import httpx
+
+                settings.fonts_dir.mkdir(parents=True, exist_ok=True)
+                resp = httpx.get(url, follow_redirects=True, timeout=8.0)
+                resp.raise_for_status()
+                if len(resp.content) > 10_000:
+                    target.write_bytes(resp.content)
+                    return str(target)
+            except Exception as exc:
+                logger.debug("Could not auto-download comic font %s (%s); using Noto Sans.", fname, exc)
+    return None
+
+
 @functools.lru_cache(maxsize=64)
-def resolve_font_path(script: str, bold: bool = False, meme_style: bool = False) -> str:
+def resolve_font_path(
+    script: str,
+    bold: bool = False,
+    meme_style: bool = False,
+    comic_style: bool = False,
+) -> str:
     """Resolve the best local TrueType/OpenType font file for a given script and weight."""
+    if comic_style and not meme_style and script == "latin":
+        comic_path = _resolve_comic_font_path(bold=True)
+        if comic_path:
+            return comic_path
+
     key = "latin_meme" if (meme_style and script == "latin") else script
     families = SCRIPT_FONT_FAMILIES.get(key, SCRIPT_FONT_FAMILIES["latin"])
     weight = "Bold" if bold else "Regular"
@@ -249,11 +294,12 @@ def load_font(
     size: int,
     bold: bool = False,
     meme_style: bool = False,
+    comic_style: bool = False,
 ) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
     lang_info = get_language(target_lang)
     detected_script = detect_script(text)
     script = detected_script if detected_script != "latin" else lang_info.script
-    font_path = resolve_font_path(script, bold=bold, meme_style=meme_style)
+    font_path = resolve_font_path(script, bold=bold, meme_style=meme_style, comic_style=comic_style)
     loaded = _open_font(font_path, size)
     return loaded if loaded is not None else ImageFont.load_default()
 
@@ -264,6 +310,7 @@ def load_font_chain(
     size: int,
     bold: bool = False,
     meme_style: bool = False,
+    comic_style: bool = False,
 ) -> List[FontEntry]:
     """
     Build an ordered font fallback chain (primary script font -> matching-weight Latin/punctuation
@@ -275,12 +322,12 @@ def load_font_chain(
     script = detected_script if detected_script != "latin" else lang_info.script
 
     candidate_paths: List[str] = []
-    primary = resolve_font_path(script, bold=bold, meme_style=meme_style)
+    primary = resolve_font_path(script, bold=bold, meme_style=meme_style, comic_style=comic_style)
     if primary:
         candidate_paths.append(primary)
 
     # Always append matching-weight Latin/punctuation Noto Sans fallback if primary is a non-Latin subset
-    latin_fallback = resolve_font_path("latin", bold=bold, meme_style=meme_style)
+    latin_fallback = resolve_font_path("latin", bold=bold, meme_style=meme_style, comic_style=False)
     if latin_fallback and latin_fallback not in candidate_paths:
         candidate_paths.append(latin_fallback)
 

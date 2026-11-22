@@ -34,6 +34,8 @@ class OCRBlock:
     angle: float = 0.0
     alignment: str = "center"
     is_vertical: bool = False
+    is_comic_block: bool = False
+    comic_seg_mask: Optional[np.ndarray] = None  # Learned pixel ink mask from comic-text-detector
 
 
 class OCREngine:
@@ -116,6 +118,90 @@ class OCREngine:
             )
 
         return group_ocr_lines(raw_lines)
+
+    def recognize_crop(
+        self,
+        crop_rgb: np.ndarray,
+        offset_xy: Tuple[int, int] = (0, 0),
+        min_confidence: float = 0.35,
+    ) -> Tuple[str, float, List[OCRLine]]:
+        """
+        Recognize text inside a single speech-bubble crop using RapidOCR.
+        Falls back to recognition-only mode for tight single-word stylized bubbles
+        when RapidOCR's detector misses them.
+        """
+        self._ensure_loaded()
+        if crop_rgb is None or crop_rgb.size == 0:
+            return "", 0.0, []
+
+        ox, oy = offset_xy
+        ch, cw = crop_rgb.shape[:2]
+        crop_bgr = crop_rgb[:, :, ::-1].copy()
+        result, _ = self._engine(crop_bgr)
+
+        raw_lines: List[OCRLine] = []
+        if result:
+            for item in result:
+                box, text, score = item[0], str(item[1]).strip(), float(item[2])
+                if not text or score < min_confidence:
+                    continue
+                pts = [[float(p[0]) + ox, float(p[1]) + oy] for p in box]
+                xs = [p[0] for p in pts]
+                ys = [p[1] for p in pts]
+                x1 = int(math.floor(min(xs)))
+                y1 = int(math.floor(min(ys)))
+                x2 = int(math.ceil(max(xs)))
+                y2 = int(math.ceil(max(ys)))
+                bw = max(1, x2 - x1)
+                bh = max(1, y2 - y1)
+                script = detect_script(text)
+                is_vert = script.startswith("cjk") and bh > bw * 1.45 and len(text) >= 2
+                left_h = math.hypot(pts[3][0] - pts[0][0], pts[3][1] - pts[0][1])
+                right_h = math.hypot(pts[2][0] - pts[1][0], pts[2][1] - pts[1][1])
+                line_h = float(bw) if is_vert else max(8.0, (left_h + right_h) / 2.0)
+                raw_lines.append(
+                    OCRLine(
+                        polygon=pts,
+                        text=text,
+                        confidence=score,
+                        bbox=(x1, y1, x2, y2),
+                        height=line_h,
+                        width=float(bw),
+                        angle=0.0,
+                        is_vertical=is_vert,
+                    )
+                )
+
+        if raw_lines:
+            if all(l.is_vertical for l in raw_lines):
+                raw_lines.sort(key=lambda l: (-l.bbox[0], l.bbox[1]))
+                combined = "".join(l.text for l in raw_lines)
+            else:
+                avg_h = max(1.0, sum(l.height for l in raw_lines) / len(raw_lines))
+                raw_lines.sort(key=lambda l: (round(l.bbox[1] / (avg_h * 0.6)), l.bbox[0]))
+                parts = [l.text for l in raw_lines if l.text]
+                sample = "".join(parts)
+                joiner = "" if detect_script(sample).startswith("cjk") else " "
+                combined = joiner.join(parts)
+            avg_conf = sum(l.confidence for l in raw_lines) / len(raw_lines)
+            return combined.strip(), float(avg_conf), raw_lines
+
+        # Safety net: recognition-only pass for tight single-line bubbles where det missed
+        if cw >= bh_min(ch) and ch <= cw * 1.2:
+            try:
+                rec_res, _ = self._engine(crop_bgr, use_det=False, use_cls=False, use_rec=True)
+                if rec_res:
+                    txt, sc = str(rec_res[0][0]).strip(), float(rec_res[0][1])
+                    if txt and sc >= min_confidence:
+                        return txt, sc, []
+            except Exception:
+                pass
+
+        return "", 0.0, []
+
+
+def bh_min(h: int) -> int:
+    return max(8, int(h * 0.4))
 
 
 def _horizontal_overlap_ratio(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> float:

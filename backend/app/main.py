@@ -8,8 +8,10 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 
 from app.config import settings
 from app.languages import LANGUAGES
+from app.pipeline.comic_detector import comic_detector
 from app.pipeline.fonts import is_raqm_available
 from app.pipeline.inpainter import get_onnx_providers, inpainter
+from app.pipeline.manga_ocr import manga_ocr
 from app.pipeline.translator import translator_registry
 from app.schemas import JobInfo, JobItemInfo, LanguageDTO, RerenderRequest, SystemStatus
 from app.services.jobs import job_manager
@@ -56,6 +58,8 @@ async def system_status():
     device = "cuda" if "CUDAExecutionProvider" in providers else "cpu"
     return SystemStatus(
         lama_downloaded=inpainter.is_downloaded(),
+        comic_detector_downloaded=comic_detector.is_downloaded(),
+        manga_ocr_downloaded=manga_ocr.is_downloaded(),
         raqm_available=is_raqm_available(),
         device=device,
         translators=translator_registry.list_info(),
