@@ -1,0 +1,9 @@
+[project]
+name = "photo-translate-backend"
+version = "0.1.0"
+description = "Local multilingual image text translation backend"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
