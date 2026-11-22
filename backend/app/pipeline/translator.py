@@ -246,7 +246,11 @@ class DeepSeekTranslator(BaseTranslator):
         if not self.is_available():
             raise RuntimeError("DeepSeek API key is not configured (set PHOTO_TRANSLATE_DEEPSEEK_API_KEY).")
 
-        src_name = get_language(source_lang).name if source_lang and source_lang != "auto" else "the detected source language"
+        src_name = (
+            get_language(source_lang).name
+            if source_lang and source_lang != "auto"
+            else "the detected source language"
+        )
         tgt_info = get_language(target_lang)
         tgt_name = f"{tgt_info.name} ({tgt_info.native_name})"
 
@@ -281,8 +285,15 @@ class DeepSeekTranslator(BaseTranslator):
             raise RuntimeError(self._format_api_error(resp))
 
         data = resp.json()
-        content = data["choices"][0]["message"]["content"]
-        parsed = json.loads(content)
+        cleaned = data["choices"][0]["message"]["content"].strip()
+        if cleaned.startswith("```"):
+            lines = cleaned.splitlines()
+            if lines and lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            cleaned = "\n".join(lines).strip()
+        parsed = json.loads(cleaned)
 
         translated_map: Dict[int, str] = {}
         rows = parsed.get("translations") if isinstance(parsed, dict) else None

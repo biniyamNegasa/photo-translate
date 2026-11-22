@@ -368,3 +368,46 @@ def test_deepseek_translator_batch_adapter():
         assert captured["headers"]["Authorization"] == "Bearer sk-test-deepseek"
         assert captured["json"]["model"] == settings.deepseek_model
         assert captured["json"]["response_format"] == {"type": "json_object"}
+
+
+def test_vertical_cjk_column_grouping():
+    from app.pipeline.ocr import OCRLine, group_ocr_lines
+
+    # Two vertical Japanese columns inside one speech bubble (rightmost column reads first!)
+    col_left = OCRLine(
+        polygon=[[100, 50], [130, 50], [130, 210], [100, 210]],
+        text="世界だ",
+        confidence=0.95,
+        bbox=(100, 50, 130, 210),
+        height=30.0,
+        width=30.0,
+        angle=0.0,
+        is_vertical=True,
+    )
+    col_right = OCRLine(
+        polygon=[[142, 48], [172, 48], [172, 208], [142, 208]],
+        text="すごい",
+        confidence=0.96,
+        bbox=(142, 48, 172, 208),
+        height=30.0,
+        width=30.0,
+        angle=0.0,
+        is_vertical=True,
+    )
+    blocks = group_ocr_lines([col_left, col_right])
+    assert len(blocks) == 1
+    assert blocks[0].is_vertical is True
+    assert blocks[0].text == "すごい世界だ"
+
+
+def test_balanced_line_wrapping():
+    from app.pipeline.fonts import load_font_chain
+    from app.pipeline.renderer import _wrap_balanced_words
+
+    img = Image.new("RGBA", (400, 200), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    chain = load_font_chain("WHAT ARE YOU DOING", "en", size=24, bold=True)
+    # Width fits ~2 words per line; balanced wrapping should produce 2 balanced lines (not 3+1)
+    lines = _wrap_balanced_words(draw, ["WHAT", "ARE", "YOU", "DOING?"], chain, max_width=190, stroke_width=0, direction=None)
+    assert len(lines) == 2
+    assert lines == ["WHAT ARE", "YOU DOING?"]

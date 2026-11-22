@@ -17,6 +17,43 @@ logger = logging.getLogger(__name__)
 StageCallback = Callable[[ItemStatus, str], None]
 
 
+def _fill_uniform_bubble_masks(
+    image_rgb: np.ndarray,
+    blocks: List[TextBlock],
+    block_masks: Dict[str, np.ndarray],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Hybrid erasure:
+      - Clean uniform-background blocks (speech bubbles, solid caption bars) are filled
+        directly with their exact sampled `bg_color` (1px soft edge feather) for zero
+        LaMa blur or smudge artifacts.
+      - Non-uniform / outlined blocks are collected into `lama_mask` for patch-based LaMa ONNX.
+    Returns: (partially_cleaned_rgb, lama_mask)
+    """
+    h_img, w_img = image_rgb.shape[:2]
+    cleaned = image_rgb.copy()
+    lama_mask = np.zeros((h_img, w_img), dtype=np.uint8)
+
+    for blk in blocks:
+        m = block_masks.get(blk.id)
+        if m is None:
+            continue
+        if blk.style.uniform_bg:
+            # Clean studio-grade solid fill inside speech bubbles and solid caption bars
+            alpha = cv2.GaussianBlur(m.astype(np.float32) / 255.0, (3, 3), 0)
+            alpha = np.clip(alpha * 1.25, 0.0, 1.0)[..., None]
+            bg_fill = np.array(blk.style.bg_color, dtype=np.float32)
+            cleaned = np.clip(
+                bg_fill * alpha + cleaned.astype(np.float32) * (1.0 - alpha),
+                0,
+                255,
+            ).astype(np.uint8)
+        else:
+            lama_mask = cv2.bitwise_or(lama_mask, m)
+
+    return cleaned, lama_mask
+
+
 def process_image_pipeline(
     image_rgb: np.ndarray,
     source_lang: str,
@@ -27,11 +64,11 @@ def process_image_pipeline(
 ) -> Tuple[np.ndarray, np.ndarray, Dict[str, np.ndarray], List[TextBlock]]:
     """
     Execute the image text-translation pipeline:
-      1. Multilingual OCR + multi-line block grouping
-      2. Tight character-level mask extraction + typography style analysis
-      3. Full-resolution patch-based LaMa ONNX inpainting
-      4. Pluggable API text translation (Addis AI / Google / DeepL)
-      5. Pixel-exact compositing + style-matched HarfBuzz rendering
+      1. Multilingual OCR + horizontal & vertical manga column grouping
+      2. Stroke-complete mask extraction + typography & speech-bubble geometry analysis
+      3. Hybrid erasure: clean solid fill for speech bubbles + full-res LaMa ONNX for scenes/memes
+      4. Pluggable API translation (DeepSeek Vision / Addis AI / Google / DeepL)
+      5. Pixel-exact compositing + ink-centered, balanced HarfBuzz rendering
 
     Returns: (translated_rgb, inpainted_rgb, block_masks, blocks)
     """
@@ -42,14 +79,11 @@ def process_image_pipeline(
     if not ocr_blocks:
         return image_rgb.copy(), image_rgb.copy(), {}, []
 
-    # Build per-block masks & extract visual styles
-    h_img, w_img = image_rgb.shape[:2]
-    combined_mask = np.zeros((h_img, w_img), dtype=np.uint8)
     block_masks: Dict[str, np.ndarray] = {}
     blocks: List[TextBlock] = []
 
     # When source_lang is "auto", detect dominant language per script across the WHOLE image
-    # so short 1-3 word blocks (e.g. comic sound effects) don't get misclassified by langdetect.
+    # so short 1-3 word blocks don't get misclassified by langdetect.
     script_lang_map: Dict[str, str] = {}
     if source_lang == "auto":
         texts_by_script: Dict[str, List[str]] = {}
@@ -63,7 +97,6 @@ def process_image_pipeline(
     for ob in ocr_blocks:
         mask, style, expanded_bbox = extract_block_mask_and_style(image_rgb, ob)
         block_masks[ob.id] = mask
-        combined_mask = cv2.bitwise_or(combined_mask, mask)
 
         if source_lang != "auto":
             detected_src = detect_language_code(ob.text, hint=source_lang)
@@ -87,12 +120,16 @@ def process_image_pipeline(
             )
         )
 
-    # Inpaint masked regions cleanly
+    # Hybrid erasure: clean solid fill for uniform bubbles + LaMa ONNX for textured/outlined text
     if on_stage:
-        on_stage(ItemStatus.INPAINTING, "Erasing original text with LaMa...")
-    inpainted_rgb = inpainter.inpaint(image_rgb, combined_mask, use_lama=use_lama)
+        on_stage(ItemStatus.INPAINTING, "Erasing original text...")
+    pre_cleaned, lama_mask = _fill_uniform_bubble_masks(image_rgb, blocks, block_masks)
+    if np.count_nonzero(lama_mask) > 0:
+        inpainted_rgb = inpainter.inpaint(pre_cleaned, lama_mask, use_lama=use_lama)
+    else:
+        inpainted_rgb = pre_cleaned
 
-    # Translate grouped blocks (group by detected source language for batch speed)
+    # Translate grouped blocks
     if on_stage:
         on_stage(ItemStatus.TRANSLATING, f"Translating {len(blocks)} text block(s)...")
 

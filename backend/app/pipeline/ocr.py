@@ -6,6 +6,7 @@ from typing import List, Optional, Tuple
 import numpy as np
 
 from app.config import settings
+from app.languages import detect_script
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +18,9 @@ class OCRLine:
     confidence: float
     bbox: Tuple[int, int, int, int]  # x1, y1, x2, y2
     height: float
+    width: float
     angle: float                     # degrees
+    is_vertical: bool = False
 
 
 @dataclass
@@ -30,6 +33,7 @@ class OCRBlock:
     confidence: float = 1.0
     angle: float = 0.0
     alignment: str = "center"
+    is_vertical: bool = False
 
 
 class OCREngine:
@@ -53,7 +57,6 @@ class OCREngine:
         self._ensure_loaded()
         conf_threshold = min_confidence if min_confidence is not None else settings.ocr_min_confidence
 
-        # RapidOCR expects BGR or RGB numpy array (it handles RGB/BGR smoothly, BGR is native OpenCV)
         image_bgr = image_rgb[:, :, ::-1].copy()
         result, _ = self._engine(image_bgr)
         if not result:
@@ -75,18 +78,28 @@ class OCREngine:
             x2 = min(w_img, int(math.ceil(max(xs))))
             y2 = min(h_img, int(math.ceil(max(ys))))
 
-            # Compute line height and angle from top edge (p0 -> p1)
+            bw = max(1, x2 - x1)
+            bh = max(1, y2 - y1)
+
+            # Detect vertical East-Asian (Japanese/Chinese) manga columns
+            script = detect_script(text)
+            is_vertical = (
+                script.startswith("cjk")
+                and bh > bw * 1.45
+                and len(text) >= 2
+            )
+
             dx = pts[1][0] - pts[0][0]
             dy = pts[1][1] - pts[0][1]
-            angle = math.degrees(math.atan2(dy, dx))
-            if abs(angle) < 2.5:
+            angle = 0.0 if is_vertical else math.degrees(math.atan2(dy, dx))
+            if abs(angle) < 2.5 or abs(angle) > 75.0:
                 angle = 0.0
 
             left_h = math.hypot(pts[3][0] - pts[0][0], pts[3][1] - pts[0][1])
             right_h = math.hypot(pts[2][0] - pts[1][0], pts[2][1] - pts[1][1])
-            line_h = (left_h + right_h) / 2.0
+            line_h = float(bw) if is_vertical else (left_h + right_h) / 2.0
 
-            if line_h < settings.ocr_min_box_height or (x2 - x1) < 4:
+            if min(bw, bh) < settings.ocr_min_box_height:
                 continue
 
             raw_lines.append(
@@ -96,7 +109,9 @@ class OCREngine:
                     confidence=score,
                     bbox=(x1, y1, x2, y2),
                     height=line_h,
+                    width=float(bw),
                     angle=angle,
+                    is_vertical=is_vertical,
                 )
             )
 
@@ -109,13 +124,34 @@ def _horizontal_overlap_ratio(a: Tuple[int, int, int, int], b: Tuple[int, int, i
     return inter / min_w
 
 
+def _vertical_overlap_ratio(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> float:
+    inter = max(0, min(a[3], b[3]) - max(a[1], b[1]))
+    min_h = max(1, min(a[3] - a[1], b[3] - b[1]))
+    return inter / min_h
+
+
 def _should_merge(line_a: OCRLine, line_b: OCRLine) -> bool:
-    """Decide whether two adjacent OCR lines belong to the same paragraph/caption/bubble."""
-    # Must have similar orientation
+    """Decide whether two adjacent OCR lines/columns belong to the same caption or speech bubble."""
+    if line_a.is_vertical != line_b.is_vertical:
+        return False
+
+    # Vertical East-Asian manga columns: group horizontally adjacent columns into one speech bubble
+    if line_a.is_vertical:
+        left, right = (line_a, line_b) if line_a.bbox[0] <= line_b.bbox[0] else (line_b, line_a)
+        avg_col_w = (line_a.width + line_b.width) / 2.0
+        w_ratio = max(line_a.width, line_b.width) / max(1.0, min(line_a.width, line_b.width))
+        if w_ratio > 1.75:
+            return False
+        h_gap = right.bbox[0] - left.bbox[2]
+        v_ov = _vertical_overlap_ratio(left.bbox, right.bbox)
+        if -avg_col_w * 0.3 <= h_gap <= avg_col_w * 1.1 and v_ov >= 0.35:
+            return True
+        return False
+
+    # Horizontal text lines
     if abs(line_a.angle - line_b.angle) > 12.0:
         return False
 
-    # Similar font size
     h_ratio = max(line_a.height, line_b.height) / max(1.0, min(line_a.height, line_b.height))
     if h_ratio > 1.65:
         return False
@@ -144,7 +180,7 @@ def _should_merge(line_a: OCRLine, line_b: OCRLine) -> bool:
 
 
 def _infer_alignment(lines: List[OCRLine], block_bbox: Tuple[int, int, int, int]) -> str:
-    if len(lines) <= 1:
+    if len(lines) <= 1 or lines[0].is_vertical:
         return "center"
     bx1, _, bx2, _ = block_bbox
     bcx = (bx1 + bx2) / 2.0
@@ -186,40 +222,43 @@ def group_ocr_lines(lines: List[OCRLine]) -> List[OCRBlock]:
         groups.setdefault(root, []).append(lines[idx])
 
     blocks: List[OCRBlock] = []
-    # Sort blocks top-to-bottom, left-to-right
+    # Sort blocks top-to-bottom; for Japanese vertical manga blocks prefer right-to-left within the same row band
     sorted_groups = sorted(
         groups.values(),
         key=lambda grp: (min(l.bbox[1] for l in grp), min(l.bbox[0] for l in grp)),
     )
 
     for b_idx, grp in enumerate(sorted_groups):
-        # Order lines within block by row (bucketed by half-line-height) then x1
-        avg_h = max(1.0, sum(l.height for l in grp) / len(grp))
-        grp.sort(key=lambda l: (round(l.bbox[1] / (avg_h * 0.6)), l.bbox[0]))
+        is_vert_block = grp[0].is_vertical
+        if is_vert_block:
+            # Right-to-left column reading order for Japanese/Chinese vertical manga
+            grp.sort(key=lambda l: (-l.bbox[0], l.bbox[1]))
+            combined_text = "".join(l.text.strip() for l in grp if l.text.strip())
+        else:
+            avg_h = max(1.0, sum(l.height for l in grp) / len(grp))
+            grp.sort(key=lambda l: (round(l.bbox[1] / (avg_h * 0.6)), l.bbox[0]))
+            parts = [l.text.strip() for l in grp if l.text.strip()]
+            # Join without extra space if CJK, else space
+            sample = "".join(parts)
+            joiner = "" if detect_script(sample).startswith("cjk") else " "
+            combined_text = joiner.join(parts)
 
         x1 = min(l.bbox[0] for l in grp)
         y1 = min(l.bbox[1] for l in grp)
         x2 = max(l.bbox[2] for l in grp)
         y2 = max(l.bbox[3] for l in grp)
 
-        # Join text naturally: space between Latin/words, no extra space for CJK
-        joined_parts: List[str] = []
-        for l in grp:
-            t = l.text.strip()
-            if t:
-                joined_parts.append(t)
-        combined_text = " ".join(joined_parts)
-
         avg_conf = sum(l.confidence for l in grp) / len(grp)
-        # Weighted average angle by line width
         total_w = sum(max(1, l.bbox[2] - l.bbox[0]) for l in grp)
-        avg_angle = sum(l.angle * max(1, l.bbox[2] - l.bbox[0]) for l in grp) / total_w
+        avg_angle = 0.0 if is_vert_block else (
+            sum(l.angle * max(1, l.bbox[2] - l.bbox[0]) for l in grp) / total_w
+        )
         if abs(avg_angle) < 2.5:
             avg_angle = 0.0
 
         alignment = _infer_alignment(grp, (x1, y1, x2, y2))
         polygon = [[float(x1), float(y1)], [float(x2), float(y1)], [float(x2), float(y2)], [float(x1), float(y2)]]
-        if len(grp) == 1:
+        if len(grp) == 1 and not is_vert_block:
             polygon = grp[0].polygon
 
         blocks.append(
@@ -232,6 +271,7 @@ def group_ocr_lines(lines: List[OCRLine]) -> List[OCRBlock]:
                 confidence=round(avg_conf, 3),
                 angle=round(avg_angle, 2),
                 alignment=alignment,
+                is_vertical=is_vert_block,
             )
         )
 
