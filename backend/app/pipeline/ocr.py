@@ -142,7 +142,7 @@ class OCREngine:
         ox, oy = offset_xy
         ch, cw = crop_rgb.shape[:2]
         crop_bgr = crop_rgb[:, :, ::-1].copy()
-        result, _ = self._engine(crop_bgr)
+        result, _ = self._engine(crop_bgr, use_det=True, use_cls=False, use_rec=True)
 
         raw_lines: List[OCRLine] = []
         if result:
@@ -203,6 +203,153 @@ class OCREngine:
                 pass
 
         return "", 0.0, []
+
+    def recognize_region_lines(
+        self,
+        image_rgb: np.ndarray,
+        bubble_bbox: Tuple[int, int, int, int],
+        line_bboxes: List[Tuple[int, int, int, int]],
+        is_vertical: bool = False,
+        min_confidence: float = 0.35,
+    ) -> Tuple[str, float, List[OCRLine]]:
+        """
+        Fast recognition-only OCR (`use_det=False, use_cls=False, use_rec=True`) using the
+        DBNet text-line boxes already detected by `comic-text-detector`. Avoids running
+        RapidOCR's full DBNet detector again on every speech bubble (~15-20x faster on CPU).
+        Returns `("", 0.0, [])` if the region is unsuitable for rec-only so the caller can
+        fall back to `recognize_crop` for that individual bubble.
+        """
+        if is_vertical or not line_bboxes:
+            return "", 0.0, []
+
+        self._ensure_loaded()
+        h_img, w_img = image_rgb.shape[:2]
+        bx1, by1, bx2, by2 = bubble_bbox
+        bw = max(1, bx2 - bx1)
+        bh = max(1, by2 - by1)
+
+        merged = _merge_same_row_lines(line_bboxes)
+        if not merged:
+            return "", 0.0, []
+
+        # Safety check: if a tall bubble only has 1 DBNet blob, it may contain multiple
+        # stacked lines that need detector splitting -> let caller fall back cleanly.
+        if len(merged) == 1 and bh > bw * 0.65:
+            lh0 = max(1, merged[0][3] - merged[0][1])
+            if bh > lh0 * 3.2:
+                return "", 0.0, []
+
+        ocr_lines: List[OCRLine] = []
+        for idx, (lx1, ly1, lx2, ly2) in enumerate(merged):
+            lw = max(1, lx2 - lx1)
+            lh = max(1, ly2 - ly1)
+            if lh > lw * 1.35:
+                # Unexpected vertical strip inside supposedly horizontal bubble -> fallback
+                return "", 0.0, []
+
+            # DBNet probability kernels are shrunken (~0.45-0.6x of real glyph height);
+            # expand cleanly while staying bounded halfway to neighboring lines.
+            prev_bot = merged[idx - 1][3] if idx > 0 else max(0, by1 - 6)
+            next_top = merged[idx + 1][1] if idx + 1 < len(merged) else min(h_img, by2 + 6)
+            max_up = max(4, (ly1 - prev_bot) // 2) if idx > 0 else max(8, int(lh * 1.1))
+            max_dn = max(4, (next_top - ly2) // 2) if idx + 1 < len(merged) else max(8, int(lh * 1.1))
+
+            py_up = min(max(6, int(lh * 0.95)), max_up)
+            py_dn = min(max(6, int(lh * 0.95)), max_dn)
+            px = max(8, int(lh * 0.80))
+
+            cx1 = max(max(0, bx1 - 6), lx1 - px)
+            cy1 = max(0, ly1 - py_up)
+            cx2 = min(min(w_img, bx2 + 6), lx2 + px)
+            cy2 = min(h_img, ly2 + py_dn)
+            if cx2 <= cx1 + 2 or cy2 <= cy1 + 2:
+                continue
+
+            crop_bgr = image_rgb[cy1:cy2, cx1:cx2, ::-1].copy()
+            try:
+                rec_res, _ = self._engine(crop_bgr, use_det=False, use_cls=False, use_rec=True)
+            except Exception:
+                continue
+            if not rec_res:
+                continue
+
+            txt, sc = str(rec_res[0][0]).strip(), float(rec_res[0][1])
+            if not txt or sc < min_confidence:
+                continue
+
+            pts = [
+                [float(cx1), float(cy1)],
+                [float(cx2), float(cy1)],
+                [float(cx2), float(cy2)],
+                [float(cx1), float(cy2)],
+            ]
+            ocr_lines.append(
+                OCRLine(
+                    polygon=pts,
+                    text=txt,
+                    confidence=sc,
+                    bbox=(cx1, cy1, cx2, cy2),
+                    height=float(max(8, cy2 - cy1)),
+                    width=float(max(1, cx2 - cx1)),
+                    angle=0.0,
+                    is_vertical=False,
+                )
+            )
+
+        if not ocr_lines:
+            return "", 0.0, []
+
+        avg_conf = sum(l.confidence for l in ocr_lines) / len(ocr_lines)
+        # If rec-only confidence is weak, let caller fall back to full det+rec on this bubble
+        if avg_conf < 0.55:
+            return "", 0.0, []
+
+        parts = [l.text for l in ocr_lines if l.text]
+        sample = "".join(parts)
+        joiner = "" if detect_script(sample).startswith("cjk") else " "
+        return joiner.join(parts).strip(), float(avg_conf), ocr_lines
+
+
+def _merge_same_row_lines(
+    line_bboxes: List[Tuple[int, int, int, int]],
+) -> List[Tuple[int, int, int, int]]:
+    """Merge horizontally adjacent DBNet line fragments that sit on the same text row."""
+    if len(line_bboxes) <= 1:
+        return list(line_bboxes)
+
+    ordered = sorted(line_bboxes, key=lambda b: ((b[1] + b[3]) * 0.5, b[0]))
+    rows: List[List[Tuple[int, int, int, int]]] = []
+
+    for box in ordered:
+        lx1, ly1, lx2, ly2 = box
+        lh = max(1, ly2 - ly1)
+        placed = False
+        for row in rows:
+            ry1 = min(b[1] for b in row)
+            ry2 = max(b[3] for b in row)
+            rh = max(1, ry2 - ry1)
+            v_inter = max(0, min(ly2, ry2) - max(ly1, ry1))
+            if v_inter >= min(lh, rh) * 0.45:
+                row.append(box)
+                placed = True
+                break
+        if not placed:
+            rows.append([box])
+
+    merged: List[Tuple[int, int, int, int]] = []
+    for row in rows:
+        row.sort(key=lambda b: b[0])
+        merged.append(
+            (
+                min(b[0] for b in row),
+                min(b[1] for b in row),
+                max(b[2] for b in row),
+                max(b[3] for b in row),
+            )
+        )
+
+    merged.sort(key=lambda b: (b[1], b[0]))
+    return merged
 
 
 def bh_min(h: int) -> int:

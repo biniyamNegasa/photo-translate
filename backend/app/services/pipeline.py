@@ -129,11 +129,27 @@ def _detect_and_recognize_blocks(
                     m_txt = manga_ocr.recognize(crop_jp)
                     if m_txt:
                         return region, m_txt.strip(), max(region.confidence, 0.85), [], crop_jp, True
-                    r_txt, r_conf, r_lines = ocr_engine.recognize_crop(crop_rp, offset_xy=offset_xy)
+                    r_txt, r_conf, r_lines = ocr_engine.recognize_region_lines(
+                        image_rgb,
+                        bubble_bbox=region.bbox,
+                        line_bboxes=region.line_bboxes,
+                        is_vertical=region.is_vertical,
+                    )
+                    if not r_txt:
+                        r_txt, r_conf, r_lines = ocr_engine.recognize_crop(crop_rp, offset_xy=offset_xy)
                     conf = (region.confidence + r_conf) / 2.0 if r_conf > 0 else region.confidence
                     return region, r_txt.strip(), conf, r_lines, crop_jp, True
 
-                r_txt, r_conf, r_lines = ocr_engine.recognize_crop(crop_rp, offset_xy=offset_xy)
+                # Fast path: run RapidOCR recognition-only on DBNet line boxes already found by
+                # comic-text-detector (skips running RapidOCR's full DBNet detector per bubble!).
+                r_txt, r_conf, r_lines = ocr_engine.recognize_region_lines(
+                    image_rgb,
+                    bubble_bbox=region.bbox,
+                    line_bboxes=region.line_bboxes,
+                    is_vertical=region.is_vertical,
+                )
+                if not r_txt:
+                    r_txt, r_conf, r_lines = ocr_engine.recognize_crop(crop_rp, offset_xy=offset_xy)
                 conf = (region.confidence + r_conf) / 2.0 if r_conf > 0 else region.confidence
                 return region, r_txt.strip(), conf, r_lines, crop_jp, False
 

@@ -617,3 +617,33 @@ def test_western_comic_does_not_hallucinate_japanese_manga_ocr():
     assert len(blocks) == 2
     assert all(detect_script(b.source_text) == "latin" for b in blocks)
     np.testing.assert_array_equal(translated[215:325, 195:275], rgb[215:325, 195:275])
+
+
+def test_fast_rec_only_comic_line_recognition():
+    from app.pipeline.ocr import _merge_same_row_lines, ocr_engine
+
+    # Same-row DBNet fragments should merge into one horizontal line while distinct rows stay separate
+    merged = _merge_same_row_lines([
+        (120, 60, 210, 82),
+        (220, 62, 310, 84),
+        (135, 110, 295, 132),
+    ])
+    assert merged == [(120, 60, 310, 84), (135, 110, 295, 132)]
+
+    # End-to-end rec-only recognition on a two-line speech bubble
+    img = Image.new("RGB", (460, 240), (255, 255, 255))
+    draw = ImageDraw.Draw(img)
+    f = load_font("WAIT A SECOND!", "en", size=34, bold=True)
+    draw.text((80, 58), "WAIT A", font=f, fill=(15, 15, 15))
+    draw.text((80, 116), "SECOND!", font=f, fill=(15, 15, 15))
+    rgb = np.array(img, dtype=np.uint8)
+
+    text, conf, lines = ocr_engine.recognize_region_lines(
+        rgb,
+        bubble_bbox=(65, 48, 340, 165),
+        line_bboxes=[(82, 66, 200, 86), (82, 124, 240, 144)],
+        is_vertical=False,
+    )
+    assert conf >= 0.70
+    assert len(lines) == 2
+    assert "WAIT" in text.upper() and "SECOND" in text.upper()
