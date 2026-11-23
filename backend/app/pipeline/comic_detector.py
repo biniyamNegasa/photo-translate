@@ -180,7 +180,8 @@ def postprocess_comic_outputs(
     merged_boxes = _deduplicate_nested_boxes(raw_boxes)
 
     # Recover high-confidence UNet `seg` text clusters missed by YOLOv5 `blk`
-    # (e.g. standalone dramatic captions / white text directly on dark manga panels).
+    # (e.g. standalone dramatic captions / white text directly on dark manga panels),
+    # while rejecting tiny artwork specks and giant decorative SFX strokes.
     covered = np.zeros((h_img, w_img), dtype=np.uint8)
     for bx1, by1, bx2, by2, _ in merged_boxes:
         cv2.rectangle(
@@ -190,25 +191,32 @@ def postprocess_comic_outputs(
             255,
             thickness=-1,
         )
-    uncovered_seg = ((seg_prob > 0.55) & (covered == 0)).astype(np.uint8) * 255
-    if int(np.count_nonzero(uncovered_seg)) >= 120:
-        # Group nearby glyphs & wide fullwidth punctuation of the same uncovered caption/SFX cleanly
+    uncovered_seg = ((seg_prob > 0.65) & (covered == 0)).astype(np.uint8) * 255
+    min_uncov_px = max(220, int(h_img * w_img * 0.00035))
+    max_uncov_px = int(h_img * w_img * 0.06)
+    if int(np.count_nonzero(uncovered_seg)) >= min_uncov_px:
+        # Group nearby glyphs & wide fullwidth punctuation of the same uncovered caption cleanly
         k_grp = cv2.getStructuringElement(cv2.MORPH_RECT, (43, 21))
         grouped_uncov = cv2.dilate(uncovered_seg, k_grp)
         num_u, u_labels, u_stats, _ = cv2.connectedComponentsWithStats(grouped_uncov, connectivity=8)
         for uid in range(1, num_u):
             ux, uy, uw, uh, _ = u_stats[uid]
-            if uw < 14 or uh < 14:
+            if uw < 20 or uh < 18:
                 continue
             comp_mask = (u_labels == uid) & (uncovered_seg > 0)
             raw_px = int(np.count_nonzero(comp_mask))
-            if raw_px < 120:
+            if raw_px < min_uncov_px or raw_px > max_uncov_px:
                 continue
             ys_u, xs_u = np.where(comp_mask)
             tx1, ty1 = int(xs_u.min()), int(ys_u.min())
             tx2, ty2 = int(xs_u.max()) + 1, int(ys_u.max()) + 1
+            bw_u, bh_u = tx2 - tx1, ty2 - ty1
+            if bw_u < 20 or bh_u < 18:
+                continue
+            # Reject sparse scattered artwork specks (real captions have decent ink density)
+            density = raw_px / float(max(1, bw_u * bh_u))
             peak_prob = float(seg_prob[ty1:ty2, tx1:tx2].max())
-            if peak_prob >= 0.75 and (tx2 - tx1) >= 14 and (ty2 - ty1) >= 14:
+            if peak_prob >= 0.85 and density >= 0.08:
                 merged_boxes.append((tx1, ty1, tx2, ty2, round(min(0.85, peak_prob * 0.8), 3)))
 
     if not merged_boxes:

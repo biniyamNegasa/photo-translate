@@ -2,6 +2,7 @@ import functools
 import logging
 import struct
 import subprocess
+import threading
 from pathlib import Path
 from typing import Dict, FrozenSet, List, Optional, Tuple
 
@@ -17,6 +18,7 @@ COMIC_FONT_URLS = {
     "ComicNeue-Regular.ttf": "https://raw.githubusercontent.com/google/fonts/main/ofl/comicneue/ComicNeue-Regular.ttf",
 }
 _COMIC_FONT_DOWNLOAD_ATTEMPTED: set[str] = set()
+_COMIC_FONT_LOCK = threading.Lock()
 
 # Preferred font families per Unicode script (regular, bold)
 SCRIPT_FONT_FAMILIES: Dict[str, List[str]] = {
@@ -182,20 +184,24 @@ def _resolve_comic_font_path(bold: bool = True) -> Optional[str]:
         return str(target)
 
     if fname not in _COMIC_FONT_DOWNLOAD_ATTEMPTED:
-        _COMIC_FONT_DOWNLOAD_ATTEMPTED.add(fname)
-        url = COMIC_FONT_URLS.get(fname)
-        if url:
-            try:
-                import httpx
+        with _COMIC_FONT_LOCK:
+            if target.is_file() and target.stat().st_size > 10_000:
+                return str(target)
+            if fname not in _COMIC_FONT_DOWNLOAD_ATTEMPTED:
+                _COMIC_FONT_DOWNLOAD_ATTEMPTED.add(fname)
+                url = COMIC_FONT_URLS.get(fname)
+                if url:
+                    try:
+                        import httpx
 
-                settings.fonts_dir.mkdir(parents=True, exist_ok=True)
-                resp = httpx.get(url, follow_redirects=True, timeout=8.0)
-                resp.raise_for_status()
-                if len(resp.content) > 10_000:
-                    target.write_bytes(resp.content)
-                    return str(target)
-            except Exception as exc:
-                logger.debug("Could not auto-download comic font %s (%s); using Noto Sans.", fname, exc)
+                        settings.fonts_dir.mkdir(parents=True, exist_ok=True)
+                        resp = httpx.get(url, follow_redirects=True, timeout=8.0)
+                        resp.raise_for_status()
+                        if len(resp.content) > 10_000:
+                            target.write_bytes(resp.content)
+                            return str(target)
+                    except Exception as exc:
+                        logger.debug("Could not auto-download comic font %s (%s); using Noto Sans.", fname, exc)
     return None
 
 

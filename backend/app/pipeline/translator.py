@@ -1,6 +1,7 @@
 import json
 import logging
 from abc import ABC, abstractmethod
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List
 
 import httpx
@@ -44,25 +45,28 @@ class GoogleWebTranslator(BaseTranslator):
 
         src_code = get_language(source_lang).google_code or source_lang
         tgt_code = get_language(target_lang).google_code or target_lang
-        outputs: List[str] = []
+
+        def _translate_one(client: httpx.Client, txt: str) -> str:
+            resp = client.get(
+                "https://translate.googleapis.com/translate_a/single",
+                params={
+                    "client": "gtx",
+                    "sl": src_code,
+                    "tl": tgt_code,
+                    "dt": "t",
+                    "q": txt,
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            translated = "".join(seg[0] for seg in data[0] if seg and seg[0])
+            return translated.strip() or txt
 
         with httpx.Client(timeout=15.0) as client:
-            for txt in texts:
-                resp = client.get(
-                    "https://translate.googleapis.com/translate_a/single",
-                    params={
-                        "client": "gtx",
-                        "sl": src_code,
-                        "tl": tgt_code,
-                        "dt": "t",
-                        "q": txt,
-                    },
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                translated = "".join(seg[0] for seg in data[0] if seg and seg[0])
-                outputs.append(translated.strip() or txt)
-        return outputs
+            if len(texts) == 1:
+                return [_translate_one(client, texts[0])]
+            with ThreadPoolExecutor(max_workers=min(6, len(texts))) as pool:
+                return list(pool.map(lambda t: _translate_one(client, t), texts))
 
 
 class AddisAITranslator(BaseTranslator):
@@ -133,50 +137,51 @@ class AddisAITranslator(BaseTranslator):
             "Content-Type": "application/json",
             "x-api-key": settings.addis_api_key.strip(),
         }
-        outputs: List[str] = []
 
-        with httpx.Client(timeout=30.0) as client:
-            for txt in texts:
-                effective_src = src_code
-                if effective_src not in self.SUPPORTED_SOURCE_LANGS:
-                    if detect_script(txt) == "latin":
-                        effective_src = "en"
-                    else:
-                        logger.warning(
-                            "Addis AI does not support source_language='%s'; preserving original text '%s'.",
-                            effective_src,
-                            txt[:30],
-                        )
-                        outputs.append(txt)
-                        continue
+        def _translate_one(client: httpx.Client, txt: str) -> str:
+            effective_src = src_code
+            if effective_src not in self.SUPPORTED_SOURCE_LANGS:
+                if detect_script(txt) == "latin":
+                    effective_src = "en"
+                else:
+                    logger.warning(
+                        "Addis AI does not support source_language='%s'; preserving original text '%s'.",
+                        effective_src,
+                        txt[:30],
+                    )
+                    return txt
 
-                if effective_src == tgt_code:
-                    outputs.append(txt)
-                    continue
+            if effective_src == tgt_code:
+                return txt
 
+            resp = client.post(
+                settings.addis_api_url,
+                headers=headers,
+                json={
+                    "text": txt,
+                    "source_language": effective_src,
+                    "target_language": tgt_code,
+                },
+            )
+            if resp.status_code == 400 and effective_src != "en" and detect_script(txt) == "latin":
                 resp = client.post(
                     settings.addis_api_url,
                     headers=headers,
                     json={
                         "text": txt,
-                        "source_language": effective_src,
+                        "source_language": "en",
                         "target_language": tgt_code,
                     },
                 )
-                if resp.status_code == 400 and effective_src != "en" and detect_script(txt) == "latin":
-                    resp = client.post(
-                        settings.addis_api_url,
-                        headers=headers,
-                        json={
-                            "text": txt,
-                            "source_language": "en",
-                            "target_language": tgt_code,
-                        },
-                    )
-                if resp.status_code >= 400:
-                    raise RuntimeError(self._format_api_error(resp))
-                outputs.append(self._extract_translation(resp.json(), txt))
-        return outputs
+            if resp.status_code >= 400:
+                raise RuntimeError(self._format_api_error(resp))
+            return self._extract_translation(resp.json(), txt)
+
+        with httpx.Client(timeout=30.0) as client:
+            if len(texts) == 1:
+                return [_translate_one(client, texts[0])]
+            with ThreadPoolExecutor(max_workers=min(6, len(texts))) as pool:
+                return list(pool.map(lambda t: _translate_one(client, t), texts))
 
 
 class DeepLTranslator(BaseTranslator):

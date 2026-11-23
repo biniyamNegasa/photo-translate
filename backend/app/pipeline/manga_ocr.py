@@ -1,4 +1,5 @@
 import logging
+import os
 import re
 import threading
 from pathlib import Path
@@ -78,6 +79,7 @@ class MangaOCROnnx:
         self._dec_sess = None
         self._vocab: List[str] = []
         self._lock = threading.Lock()
+        self._infer_lock = threading.Lock()
         self._load_failed = False
 
     def model_dir(self) -> Path:
@@ -146,6 +148,8 @@ class MangaOCROnnx:
 
                 sess_opts = ort.SessionOptions()
                 sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+                sess_opts.intra_op_num_threads = max(1, (os.cpu_count() or 4) // 2)
+                sess_opts.inter_op_num_threads = 1
                 providers = get_onnx_providers()
                 logger.info("Loading quantized MangaOCR ONNX sessions on %s...", providers[0])
                 self._enc_sess = ort.InferenceSession(
@@ -176,25 +180,26 @@ class MangaOCROnnx:
             return None
 
         pixel_values = preprocess_manga_crop(crop_rgb)
-        enc_hidden = self._enc_sess.run(None, {"pixel_values": pixel_values})[0]
+        with self._infer_lock:
+            enc_hidden = self._enc_sess.run(None, {"pixel_values": pixel_values})[0]
 
-        ids: List[int] = [START_TOKEN_ID]
-        for _ in range(max_length):
-            logits = self._dec_sess.run(
-                None,
-                {
-                    "input_ids": np.array([ids], dtype=np.int64),
-                    "encoder_hidden_states": enc_hidden,
-                },
-            )[0]
-            next_id = int(np.argmax(logits[0, -1]))
-            if next_id == EOS_TOKEN_ID:
-                break
-            ids.append(next_id)
-            if _has_repetition_loop(ids):
-                # Trim trailing repeated tail cleanly
-                ids = ids[:-6]
-                break
+            ids: List[int] = [START_TOKEN_ID]
+            for _ in range(max_length):
+                logits = self._dec_sess.run(
+                    None,
+                    {
+                        "input_ids": np.array([ids], dtype=np.int64),
+                        "encoder_hidden_states": enc_hidden,
+                    },
+                )[0]
+                next_id = int(np.argmax(logits[0, -1]))
+                if next_id == EOS_TOKEN_ID:
+                    break
+                ids.append(next_id)
+                if _has_repetition_loop(ids):
+                    # Trim trailing repeated tail cleanly
+                    ids = ids[:-6]
+                    break
 
         return decode_manga_tokens(ids, self._vocab)
 

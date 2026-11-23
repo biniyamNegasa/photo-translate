@@ -130,14 +130,19 @@ class JobManager:
             try:
                 q.put_nowait((event, payload))
             except asyncio.QueueFull:
-                pass
+                # Drop oldest stale snapshot so clients always receive the latest state & final "done"
+                try:
+                    q.get_nowait()
+                    q.put_nowait((event, payload))
+                except Exception:
+                    pass
 
     def _publish_threadsafe(self, job: JobInfo, event: str = "update") -> None:
         if self._loop and self._loop.is_running():
             self._loop.call_soon_threadsafe(self._publish, job, event)
 
     async def subscribe(self, job_id: str) -> AsyncGenerator[str, None]:
-        q: asyncio.Queue = asyncio.Queue(maxsize=64)
+        q: asyncio.Queue = asyncio.Queue(maxsize=256)
         self._subscribers.setdefault(job_id, []).append(q)
         try:
             job = self.get_job(job_id)
@@ -182,25 +187,32 @@ class JobManager:
         storage.save_job_meta(job)
         self._publish(job, "update")
 
-        any_succeeded = False
-        for item in job.items:
-            try:
-                await asyncio.to_thread(self._process_single_item, job, item)
-                if item.status in (ItemStatus.COMPLETED, ItemStatus.NO_TEXT):
-                    any_succeeded = True
-            except Exception as exc:
-                logger.exception("Failed processing item %s/%s: %s", job.job_id, item.item_id, exc)
-                item.status = ItemStatus.FAILED
-                item.error = str(exc)
-                item.stage_message = "Failed"
-            finally:
-                job.completed_items = sum(
-                    1
-                    for it in job.items
-                    if it.status in (ItemStatus.COMPLETED, ItemStatus.NO_TEXT, ItemStatus.FAILED)
-                )
-                storage.save_job_meta(job)
-                self._publish(job, "update")
+        sem = asyncio.Semaphore(max(1, settings.item_concurrency))
+
+        async def _run_item(item: JobItemInfo) -> bool:
+            async with sem:
+                succeeded = False
+                try:
+                    await asyncio.to_thread(self._process_single_item, job, item)
+                    if item.status in (ItemStatus.COMPLETED, ItemStatus.NO_TEXT):
+                        succeeded = True
+                except Exception as exc:
+                    logger.exception("Failed processing item %s/%s: %s", job.job_id, item.item_id, exc)
+                    item.status = ItemStatus.FAILED
+                    item.error = str(exc)
+                    item.stage_message = "Failed"
+                finally:
+                    job.completed_items = sum(
+                        1
+                        for it in job.items
+                        if it.status in (ItemStatus.COMPLETED, ItemStatus.NO_TEXT, ItemStatus.FAILED)
+                    )
+                    storage.save_job_meta(job)
+                    self._publish(job, "update")
+                return succeeded
+
+        results = await asyncio.gather(*(_run_item(item) for item in job.items))
+        any_succeeded = any(results)
 
         job.status = JobStatus.COMPLETED if (any_succeeded or not job.items) else JobStatus.FAILED
         storage.save_job_meta(job)

@@ -56,6 +56,7 @@ Open **http://localhost:3000** in your browser.
 | Variable | Default | Description |
 | --- | --- | --- |
 | `PHOTO_TRANSLATE_JOB_TTL_SECONDS` | `3600` | Auto-expiry time for temporary job files |
+| `PHOTO_TRANSLATE_ITEM_CONCURRENCY` | `3` | Number of images processed concurrently per batch job |
 | `PHOTO_TRANSLATE_DEEPSEEK_API_KEY` | *(empty)* | Enables DeepSeek context-aware batch translator when set |
 | `PHOTO_TRANSLATE_DEEPSEEK_MODEL` | `deepseek-chat` | DeepSeek model name |
 | `PHOTO_TRANSLATE_ADDIS_API_KEY` | *(empty)* | Enables Addis AI adapter (`am`, `om`, `ti`, `en`, `sw`) when set |

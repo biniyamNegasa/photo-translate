@@ -171,7 +171,7 @@ def test_fastapi_batch_job_and_instant_rerender():
 
     with patch("app.services.pipeline.translator_registry.get", return_value=MockTranslator()), patch(
         "app.pipeline.inpainter.inpainter._ensure_loaded", return_value=False
-    ):
+    ), patch("app.pipeline.comic_detector.comic_detector._ensure_loaded", return_value=False):
         with TestClient(app) as client:
             resp = client.post(
                 "/api/jobs",
@@ -527,3 +527,93 @@ def test_end_to_end_japanese_manga_page_onnx():
 
     # Untouched panel artwork must remain 100% bit-for-bit identical!
     np.testing.assert_array_equal(translated[400:540, 330:470], manga_rgb[400:540, 330:470])
+
+
+def test_parallel_batch_item_execution():
+    import threading
+    import time
+    from app.main import app
+
+    in_flight = 0
+    max_in_flight = 0
+    lock = threading.Lock()
+
+    def slow_fake_pipeline(image_rgb, source_lang, target_lang, translator_id="google", use_lama=True, on_stage=None):
+        nonlocal in_flight, max_in_flight
+        with lock:
+            in_flight += 1
+            max_in_flight = max(max_in_flight, in_flight)
+        try:
+            time.sleep(0.25)
+            return image_rgb.copy(), image_rgb.copy(), {}, []
+        finally:
+            with lock:
+                in_flight -= 1
+
+    img_buf = io.BytesIO()
+    Image.new("RGB", (64, 64), (100, 120, 140)).save(img_buf, format="PNG")
+    png_bytes = img_buf.getvalue()
+
+    with patch("app.services.jobs.process_image_pipeline", side_effect=slow_fake_pipeline):
+        with TestClient(app) as client:
+            t0 = time.perf_counter()
+            resp = client.post(
+                "/api/jobs",
+                data={"target_lang": "en", "source_lang": "auto", "translator": "google"},
+                files=[("files", (f"page_{i}.png", png_bytes, "image/png")) for i in range(4)],
+            )
+            assert resp.status_code == 200
+            job_id = resp.json()["job_id"]
+
+            job = None
+            for _ in range(50):
+                job = client.get(f"/api/jobs/{job_id}").json()
+                if job["status"] in ("completed", "failed"):
+                    break
+                time.sleep(0.05)
+            elapsed = time.perf_counter() - t0
+
+            assert job is not None and job["status"] == "completed"
+            assert job["completed_items"] == 4
+            # 4 items x 0.25s must execute concurrently (peak >= 2, total well below sequential 1.0s)
+            assert max_in_flight >= 2
+            assert elapsed < 0.85
+            client.delete(f"/api/jobs/{job_id}")
+
+
+def test_western_comic_does_not_hallucinate_japanese_manga_ocr():
+    """On an English comic page with source_lang='auto', empty artwork crops must NOT invoke MangaOCR."""
+    from app.pipeline.comic_detector import ComicRegion
+
+    img = Image.new("RGB", (600, 400), (240, 240, 240))
+    draw = ImageDraw.Draw(img)
+    f = load_font("HELLO", "en", size=28, bold=True)
+    draw.rectangle((40, 40, 260, 120), fill=(255, 255, 255), outline=(10, 10, 10), width=3)
+    draw.text((60, 62), "WAIT HERE!", font=f, fill=(10, 10, 10))
+    draw.rectangle((320, 40, 560, 120), fill=(255, 255, 255), outline=(10, 10, 10), width=3)
+    draw.text((340, 62), "LET US GO!", font=f, fill=(10, 10, 10))
+    # Untouched artwork crop with no real text
+    draw.rectangle((180, 200, 420, 340), fill=(90, 90, 90), outline=(10, 10, 10), width=3)
+    rgb = np.array(img, dtype=np.uint8)
+
+    fake_regions = [
+        ComicRegion(bbox=(45, 45, 255, 115), polygon=[[45, 45], [255, 45], [255, 115], [45, 115]], confidence=0.9),
+        ComicRegion(bbox=(325, 45, 555, 115), polygon=[[325, 45], [555, 45], [555, 115], [325, 115]], confidence=0.9),
+        ComicRegion(bbox=(190, 210, 280, 330), polygon=[[190, 210], [280, 210], [280, 330], [190, 330]], confidence=0.6, is_vertical=True),
+    ]
+
+    with patch("app.services.pipeline.comic_detector.detect", return_value=fake_regions), patch(
+        "app.services.pipeline.manga_ocr.recognize", side_effect=AssertionError("MangaOCR must not run on English comic!")
+    ), patch("app.services.pipeline.translator_registry.get", return_value=MockTranslator()):
+        translated, _, _, blocks = process_image_pipeline(
+            image_rgb=rgb,
+            source_lang="auto",
+            target_lang="am",
+            translator_id="mock",
+            use_lama=False,
+            use_comic_detector=True,
+        )
+
+    assert len(blocks) == 2
+    assert all(detect_script(b.source_text) == "latin" for b in blocks)
+    np.testing.assert_array_equal(translated[215:325, 195:275], rgb[215:325, 195:275])

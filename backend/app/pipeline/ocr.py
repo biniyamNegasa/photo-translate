@@ -1,5 +1,6 @@
 import logging
 import math
+import threading
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
@@ -43,13 +44,17 @@ class OCREngine:
 
     def __init__(self) -> None:
         self._engine = None
+        self._lock = threading.Lock()
 
     def _ensure_loaded(self) -> None:
-        if self._engine is None:
-            from rapidocr_onnxruntime import RapidOCR
+        if self._engine is not None:
+            return
+        with self._lock:
+            if self._engine is None:
+                from rapidocr_onnxruntime import RapidOCR
 
-            logger.info("Initializing RapidOCR ONNX engine...")
-            self._engine = RapidOCR()
+                logger.info("Initializing RapidOCR ONNX engine...")
+                self._engine = RapidOCR()
 
     def detect_and_group(
         self,

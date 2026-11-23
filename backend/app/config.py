@@ -23,6 +23,8 @@ class Settings(BaseSettings):
     max_upload_mb: int = 100
     max_batch_images: int = 100
     worker_concurrency: int = 2
+    item_concurrency: int = 3          # Parallel images in flight per batch job (memory-safe on 8GB RAM)
+    bubble_ocr_concurrency: int = 4    # Parallel speech-bubble OCR workers per image
 
     # Models (local ONNX for comic/manga detection, Japanese manga OCR, and LaMa inpainting)
     lama_hf_repo: str = "Carve/LaMa-ONNX"

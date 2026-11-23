@@ -1,6 +1,7 @@
 import io
 import json
 import logging
+import os
 import shutil
 import time
 import zipfile
@@ -195,7 +196,9 @@ class JobStorage:
     def save_job_meta(self, job: JobInfo) -> None:
         jdir = self.job_dir(job.job_id)
         jdir.mkdir(parents=True, exist_ok=True)
-        (jdir / "job.json").write_text(job.model_dump_json(indent=2), encoding="utf-8")
+        tmp_path = jdir / "job.json.tmp"
+        tmp_path.write_text(job.model_dump_json(indent=2), encoding="utf-8")
+        os.replace(tmp_path, jdir / "job.json")
 
     def build_batch_zip(self, job: JobInfo) -> bytes:
         buf = io.BytesIO()
