@@ -68,6 +68,8 @@ def extract_uploaded_images(
             continue
         lower = orig_name.lower()
         if lower.endswith(".zip"):
+            max_uncompressed_bytes = settings.max_upload_mb * 4 * 1024 * 1024
+            uncompressed_total = 0
             with zipfile.ZipFile(io.BytesIO(data), "r") as zf:
                 for member in sorted(zf.infolist(), key=lambda m: m.filename):
                     if member.is_dir():
@@ -81,6 +83,11 @@ def extract_uploaded_images(
                         continue
                     if len(extracted) >= max_images:
                         break
+                    uncompressed_total += max(0, member.file_size)
+                    if uncompressed_total > max_uncompressed_bytes:
+                        raise ValueError(
+                            f"ZIP archive uncompressed content exceeds the {settings.max_upload_mb * 4} MB safety limit."
+                        )
                     extracted.append((sanitize_filename(member.filename), zf.read(member)))
         else:
             ext = Path(orig_name).suffix.lower()

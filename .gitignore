@@ -6,19 +6,34 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 
-# Node / FarmJS
+# Node / Farm.js
 node_modules/
 frontend/dist/
 frontend/.farm/
 
-# Local model cache & ephemeral jobs
+# Local model cache, fonts & ephemeral jobs
 .cache/
 backend/.cache/
 *.onnx
 *.bin
 *.model
 
+# Environment & secrets
+.env
+.env.*
+!.env.example
+backend/.env
+backend/.env.*
+!backend/.env.example
+frontend/.env
+frontend/.env.*
+!frontend/.env.example
+
+# Local AI agent tooling
+.agents/
+.claude/
+skills-lock.json
+
 # OS / Editor
 .DS_Store
-.env
 *.log
