@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useRef, useState } from "react";
+import { formatCount } from "../lib/notifications";
 import { LoaderIcon, UploadIcon, XIcon } from "./Icons";
 
 interface UploadZoneProps {
@@ -76,7 +77,7 @@ export const UploadZone: React.FC<UploadZoneProps> = ({
         <div className="queue-tray">
           <div className="queue-tray-head">
             <span className="queue-count">
-              {files.length} {files.length === 1 ? "file" : "files"} selected
+              {formatCount(files.length, "file", "files")} selected
             </span>
             <div className="queue-actions">
               <button
@@ -95,7 +96,7 @@ export const UploadZone: React.FC<UploadZoneProps> = ({
               >
                 {submitting ? (
                   <>
-                    <LoaderIcon size={15} /> Translating
+                    <LoaderIcon size={15} /> Translating…
                   </>
                 ) : (
                   "Translate"
@@ -107,7 +108,9 @@ export const UploadZone: React.FC<UploadZoneProps> = ({
           <ul className="file-list" role="list" aria-label="Selected files">
             {files.slice(0, 12).map((file, idx) => (
               <li key={`${file.name}-${idx}`} className="file-tag">
-                <span className="file-tag-name">{file.name}</span>
+                <bdi className="file-tag-name" title={file.name}>
+                  {file.name}
+                </bdi>
                 <button
                   type="button"
                   className="tag-remove-btn"

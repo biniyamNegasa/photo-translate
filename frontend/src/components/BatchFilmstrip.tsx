@@ -30,6 +30,14 @@ export const BatchFilmstrip: React.FC<BatchFilmstripProps> = ({
     return <LoaderIcon size={13} color="var(--accent)" />;
   };
 
+  const statusLabel = (item: JobItemInfo): string => {
+    if (item.status === "completed") return "translated";
+    if (item.status === "no_text") return "no text found";
+    if (item.status === "failed") return "failed";
+    if (item.status === "queued") return "queued";
+    return "in progress";
+  };
+
   return (
     <div className="filmstrip" role="region" aria-label="Uploaded pages">
       {items.map((item) => {
@@ -40,20 +48,23 @@ export const BatchFilmstrip: React.FC<BatchFilmstripProps> = ({
             type="button"
             className={`thumb-card ${isCurrent ? "active" : ""}`}
             aria-current={isCurrent ? "true" : undefined}
+            aria-label={`${item.filename} — ${statusLabel(item)}`}
             onClick={() => onSelect(item.item_id)}
             title={`${item.filename}: ${item.stage_message}`}
           >
             <div className="thumb-img-wrap">
               <img
                 src={item.status === "completed" ? item.translated_url : item.original_url}
-                alt={item.filename}
+                alt=""
                 loading="lazy"
               />
               <span className="thumb-status" aria-hidden="true">
                 {renderBadge(item)}
               </span>
             </div>
-            <div className="thumb-name">{item.filename}</div>
+            <div className="thumb-name">
+              <bdi>{item.filename}</bdi>
+            </div>
           </button>
         );
       })}

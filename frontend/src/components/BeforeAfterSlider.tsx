@@ -239,6 +239,23 @@ export const BeforeAfterSlider: React.FC<BeforeAfterSliderProps> = ({ item, view
     }
   };
 
+  const handleSliderKeyDown = (e: React.KeyboardEvent) => {
+    const step = e.shiftKey ? 1 : 5;
+    if (e.key === "ArrowLeft") {
+      e.preventDefault();
+      setSplitPct((prev) => clamp(prev - step, 0, 100));
+    } else if (e.key === "ArrowRight") {
+      e.preventDefault();
+      setSplitPct((prev) => clamp(prev + step, 0, 100));
+    } else if (e.key === "Home") {
+      e.preventDefault();
+      setSplitPct(0);
+    } else if (e.key === "End") {
+      e.preventDefault();
+      setSplitPct(100);
+    }
+  };
+
   const stageCursor =
     zoom > 1
       ? isPanning
@@ -276,12 +293,11 @@ export const BeforeAfterSlider: React.FC<BeforeAfterSliderProps> = ({ item, view
 
       <div
         ref={inModal === expanded ? frameRef : undefined}
-        className="compare-frame"
+        className={`compare-frame ${isPanning || dragModeRef.current === "split" ? "is-dragging" : ""}`}
         style={{
           transform: `translate3d(${pan.x}px, ${pan.y}px, 0) scale(${zoom})`,
           transformOrigin: "center center",
-          transition:
-            isPanning || dragModeRef.current === "split" ? "none" : "transform 0.1s ease-out",
+          willChange: isPanning || zoom > 1 ? "transform" : "auto",
         }}
       >
         <img
@@ -321,11 +337,19 @@ export const BeforeAfterSlider: React.FC<BeforeAfterSliderProps> = ({ item, view
               onPointerCancel={handlePointerUp}
             >
               <div
+                role="slider"
+                tabIndex={0}
+                aria-label="Comparison split position"
+                aria-valuemin={0}
+                aria-valuemax={100}
+                aria-valuenow={Math.round(splitPct)}
+                aria-valuetext={`${Math.round(splitPct)}% original, ${Math.round(100 - splitPct)}% translated`}
                 className="compare-handle"
                 style={{
                   transform: `translate(-50%, -50%) scale(${1 / zoom})`,
                 }}
-                title="Drag to compare original and translated image"
+                onKeyDown={handleSliderKeyDown}
+                title="Drag or use arrow keys to compare original and translated image"
               >
                 <GripVerticalIcon size={15} />
               </div>
@@ -336,7 +360,7 @@ export const BeforeAfterSlider: React.FC<BeforeAfterSliderProps> = ({ item, view
         {isWorking && (
           <div className="stage-loading-overlay">
             <LoaderIcon size={26} />
-            <span>{item.stage_message || "Working..."}</span>
+            <span>{item.stage_message || "Working…"}</span>
           </div>
         )}
       </div>

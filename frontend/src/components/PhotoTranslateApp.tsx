@@ -11,13 +11,26 @@ import {
   rerenderItem,
   subscribeJobEvents,
 } from "../lib/api";
+import {
+  announceStatus,
+  getNotificationPermission,
+  playCompletionChime,
+  requestBrowserNotificationPermission,
+  sendBrowserNotification,
+  summarizeJobCompletion,
+  type BrowserNotificationPermission,
+} from "../lib/notifications";
 import type { BlockUpdate, JobInfo, LanguageDTO, SystemStatus } from "../lib/types";
 import { AdvancedDrawer } from "./AdvancedDrawer";
 import { BatchFilmstrip } from "./BatchFilmstrip";
 import { BeforeAfterSlider, type ViewMode } from "./BeforeAfterSlider";
+import { CompletionToast, type ToastNotice } from "./CompletionToast";
 import {
   AlertCircleIcon,
   ArchiveIcon,
+  BellIcon,
+  BellOffIcon,
+  CheckCircleIcon,
   DownloadIcon,
   PlusIcon,
   SlidersIcon,
@@ -44,7 +57,73 @@ export const PhotoTranslateApp: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
   const [liveStatus, setLiveStatus] = useState<string>("");
 
+  const [alertsEnabled, setAlertsEnabled] = useState(true);
+  const [notifPermission, setNotifPermission] =
+    useState<BrowserNotificationPermission>("default");
+  const [jobElapsedMs, setJobElapsedMs] = useState<number | null>(null);
+  const [showCompletionBanner, setShowCompletionBanner] = useState(true);
+  const [toastNotice, setToastNotice] = useState<ToastNotice | null>(null);
+  const [hasUnreadCompletion, setHasUnreadCompletion] = useState(false);
+
   const unsubRef = useRef<(() => void) | null>(null);
+  const jobStartedAtRef = useRef<number | null>(null);
+  const notifiedJobIdRef = useRef<string | null>(null);
+  const alertsEnabledRef = useRef(alertsEnabled);
+  alertsEnabledRef.current = alertsEnabled;
+
+  useEffect(() => {
+    setNotifPermission(getNotificationPermission());
+    try {
+      const saved = window.localStorage.getItem("photo-translate:alerts");
+      if (saved === "off") setAlertsEnabled(false);
+    } catch {
+      // ignore storage restrictions
+    }
+  }, []);
+
+  // Keep browser tab title synced with live batch progress & completion badge
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+    if (!job) {
+      document.title = "Photo Translate";
+      return;
+    }
+    if (job.status === "queued" || job.status === "processing") {
+      document.title =
+        job.total_items > 1
+          ? `(${job.completed_items}/${job.total_items}) Translating… — Photo Translate`
+          : "Translating… — Photo Translate";
+      return;
+    }
+    if (hasUnreadCompletion) {
+      if (job.status === "failed") {
+        document.title = "! Failed — Photo Translate";
+      } else {
+        document.title =
+          job.total_items > 1
+            ? `✓ Done (${job.total_items}/${job.total_items}) — Photo Translate`
+            : "✓ Done — Photo Translate";
+      }
+      return;
+    }
+    document.title = "Photo Translate";
+  }, [job, hasUnreadCompletion]);
+
+  // Clear unread tab-title completion badge once user returns to the tab
+  useEffect(() => {
+    if (!hasUnreadCompletion) return;
+    const clearUnread = () => {
+      if (!document.hidden) {
+        setHasUnreadCompletion(false);
+      }
+    };
+    window.addEventListener("focus", clearUnread);
+    document.addEventListener("visibilitychange", clearUnread);
+    return () => {
+      window.removeEventListener("focus", clearUnread);
+      document.removeEventListener("visibilitychange", clearUnread);
+    };
+  }, [hasUnreadCompletion]);
 
   useEffect(() => {
     Promise.all([fetchLanguages(), fetchSystemStatus()])
@@ -62,8 +141,8 @@ export const PhotoTranslateApp: React.FC = () => {
       .catch((err) => {
         setError(
           err instanceof Error
-            ? `Could not connect to the translation service: ${err.message}`
-            : "Could not connect to the translation service."
+            ? `Unable to reach the local translation server (${err.message}). Make sure the backend is running on port 8000 and refresh.`
+            : "Unable to reach the local translation server. Make sure the backend is running on port 8000 and refresh."
         );
       });
 
@@ -107,12 +186,90 @@ export const PhotoTranslateApp: React.FC = () => {
     setFiles((prev) => prev.filter((_, i) => i !== index));
   }, []);
 
+  const handleToggleAlerts = async () => {
+    if (!alertsEnabled) {
+      setAlertsEnabled(true);
+      try {
+        window.localStorage.setItem("photo-translate:alerts", "on");
+      } catch {
+        // ignore
+      }
+      if (getNotificationPermission() === "default") {
+        const perm = await requestBrowserNotificationPermission();
+        setNotifPermission(perm);
+      }
+      return;
+    }
+
+    if (notifPermission === "default") {
+      const perm = await requestBrowserNotificationPermission();
+      setNotifPermission(perm);
+      return;
+    }
+
+    setAlertsEnabled(false);
+    try {
+      window.localStorage.setItem("photo-translate:alerts", "off");
+    } catch {
+      // ignore
+    }
+  };
+
+  const notifyJobFinished = useCallback((finishedJob: JobInfo) => {
+    if (notifiedJobIdRef.current === finishedJob.job_id) return;
+    notifiedJobIdRef.current = finishedJob.job_id;
+
+    const elapsed =
+      jobStartedAtRef.current !== null ? Date.now() - jobStartedAtRef.current : null;
+    setJobElapsedMs(elapsed);
+    setShowCompletionBanner(true);
+
+    const summary = summarizeJobCompletion(finishedJob, elapsed);
+    const announcement = summary.detail
+      ? `${summary.headline}. ${summary.detail}.`
+      : `${summary.headline}.`;
+
+    announceStatus(announcement, setLiveStatus);
+    setToastNotice({
+      id: finishedJob.job_id,
+      headline: summary.headline,
+      detail: summary.detail,
+      isFailure: summary.isFailure,
+    });
+
+    if (typeof document !== "undefined" && document.hidden) {
+      setHasUnreadCompletion(true);
+    }
+
+    if (alertsEnabledRef.current) {
+      playCompletionChime(summary.isFailure);
+      sendBrowserNotification(
+        `Photo Translate — ${summary.headline}`,
+        summary.detail || "Your translated images are ready to review and save.",
+        `photo-translate-${finishedJob.job_id}`
+      );
+    }
+  }, []);
+
   const handleTranslate = async () => {
     if (files.length === 0) return;
     setError(null);
     setLiveStatus("");
+    setToastNotice(null);
+    setJobElapsedMs(null);
+    setShowCompletionBanner(true);
+    setHasUnreadCompletion(false);
+    notifiedJobIdRef.current = null;
+    jobStartedAtRef.current = Date.now();
     setSubmitting(true);
     unsubRef.current?.();
+
+    // Request browser notification permission inside this direct user click gesture if not yet decided
+    if (alertsEnabled && getNotificationPermission() === "default") {
+      requestBrowserNotificationPermission()
+        .then(setNotifPermission)
+        .catch(() => {});
+    }
 
     try {
       const created = await createTranslationJob({
@@ -136,11 +293,7 @@ export const PhotoTranslateApp: React.FC = () => {
             if (updated.status === "failed" && firstErr) {
               setError(firstErr);
             }
-            setLiveStatus(
-              updated.status === "completed"
-                ? `Translated ${updated.total_items} ${updated.total_items === 1 ? "image" : "images"}.`
-                : "Translation failed."
-            );
+            notifyJobFinished(updated);
             fetchSystemStatus().then(setStatus).catch(() => {});
           }
         },
@@ -170,6 +323,12 @@ export const PhotoTranslateApp: React.FC = () => {
     setSubmitting(false);
     setError(null);
     setLiveStatus("");
+    setToastNotice(null);
+    setJobElapsedMs(null);
+    setShowCompletionBanner(true);
+    setHasUnreadCompletion(false);
+    notifiedJobIdRef.current = null;
+    jobStartedAtRef.current = null;
   };
 
   const handleApplyChanges = async (updates: BlockUpdate[]) => {
@@ -186,7 +345,11 @@ export const PhotoTranslateApp: React.FC = () => {
       });
       setLiveStatus(`Applied changes to ${updatedItem.filename}.`);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not re-render image.");
+      setError(
+        err instanceof Error
+          ? `Unable to update the image (${err.message}). Check that the local server is running and try again.`
+          : "Unable to update the image. Check that the local server is running and try again."
+      );
     }
   };
 
@@ -194,9 +357,37 @@ export const PhotoTranslateApp: React.FC = () => {
     job?.items.find((it) => it.item_id === selectedItemId) || job?.items[0] || null;
   const progressPct =
     job && job.total_items > 0 ? Math.round((job.completed_items / job.total_items) * 100) : 0;
+  const activeWorkersCount = job
+    ? job.items.filter(
+        (it) =>
+          it.status === "detecting" ||
+          it.status === "inpainting" ||
+          it.status === "translating" ||
+          it.status === "rendering"
+      ).length
+    : 0;
+  const completionSummary =
+    job && (job.status === "completed" || job.status === "failed")
+      ? summarizeJobCompletion(job, jobElapsedMs)
+      : null;
+
+  const alertButtonLabel = !alertsEnabled
+    ? "Alerts off"
+    : notifPermission === "granted"
+      ? "Alerts on"
+      : notifPermission === "default"
+        ? "Notify when done"
+        : "Chime on";
+
+  const activeIndex = job && activeItem
+    ? job.items.findIndex((it) => it.item_id === activeItem.item_id)
+    : -1;
 
   return (
     <div className="studio-shell">
+      <a href="#main-content" className="skip-link">
+        Skip to main content
+      </a>
       <header className="studio-topbar">
         <div className="topbar-left">
           <h1 className="wordmark">
@@ -212,7 +403,12 @@ export const PhotoTranslateApp: React.FC = () => {
               </button>
               {activeItem && (
                 <span className="topbar-filemeta" title={activeItem.filename}>
-                  {activeItem.filename} ({activeItem.width}×{activeItem.height})
+                  {job.total_items > 1 && activeIndex >= 0 && (
+                    <span className="topbar-pagecount">
+                      {activeIndex + 1} / {job.total_items} ·{" "}
+                    </span>
+                  )}
+                  <bdi>{activeItem.filename}</bdi> ({activeItem.width}×{activeItem.height})
                 </span>
               )}
             </>
@@ -297,11 +493,12 @@ export const PhotoTranslateApp: React.FC = () => {
       </header>
 
       <main id="main-content" className="studio-main">
+        <p className="visually-hidden">Screen reader announcements</p>
         <div className="visually-hidden" aria-live="polite" aria-atomic="true">
           {liveStatus}
         </div>
 
-        {error && (
+        {error && !(completionSummary?.isFailure && showCompletionBanner) && (
           <div className="error-strip" role="alert">
             <span className="error-strip-msg">
               <AlertCircleIcon size={16} />
@@ -331,18 +528,72 @@ export const PhotoTranslateApp: React.FC = () => {
           <>
             {(job.status === "queued" || job.status === "processing") && (
               <div className="progress-strip">
-                <label htmlFor="batch-progress-bar">
-                  Translating {job.completed_items} of {job.total_items}
-                </label>
-                <progress
-                  id="batch-progress-bar"
-                  className="batch-progress"
-                  max={Math.max(1, job.total_items)}
-                  value={job.completed_items}
+                <div className="progress-strip-main">
+                  <label htmlFor="batch-progress-bar">
+                    Translating {job.completed_items} of {job.total_items}
+                    {activeWorkersCount > 1 ? ` · ${activeWorkersCount} active` : ""}
+                  </label>
+                  <progress
+                    id="batch-progress-bar"
+                    className="batch-progress"
+                    max={Math.max(1, job.total_items)}
+                    value={job.completed_items}
+                  >
+                    {progressPct}%
+                  </progress>
+                  <span className="progress-pct">{progressPct}%</span>
+                </div>
+                <button
+                  type="button"
+                  className={`btn btn-quiet notify-toggle ${alertsEnabled && notifPermission === "granted" ? "is-on" : ""}`}
+                  aria-pressed={alertsEnabled}
+                  onClick={handleToggleAlerts}
+                  title={
+                    notifPermission === "denied"
+                      ? "Browser notifications are blocked in site settings; sound chime will still play"
+                      : alertsEnabled
+                        ? "Alert when all images finish translating"
+                        : "Turn on completion notifications"
+                  }
                 >
-                  {progressPct}%
-                </progress>
-                <span>{progressPct}%</span>
+                  {alertsEnabled ? <BellIcon size={14} /> : <BellOffIcon size={14} />}
+                  <span>{alertButtonLabel}</span>
+                </button>
+              </div>
+            )}
+
+            {completionSummary && showCompletionBanner && (
+              <div
+                className={`progress-strip ${completionSummary.isFailure ? "is-failed" : "is-complete"}`}
+                role={completionSummary.isFailure ? "alert" : undefined}
+              >
+                <div className="progress-strip-main">
+                  <span className="completion-badge-icon" aria-hidden="true">
+                    {completionSummary.isFailure ? (
+                      <AlertCircleIcon size={16} />
+                    ) : (
+                      <CheckCircleIcon size={16} />
+                    )}
+                  </span>
+                  <strong className="completion-headline">{completionSummary.headline}</strong>
+                  {completionSummary.detail && (
+                    <span className="completion-detail">{completionSummary.detail}</span>
+                  )}
+                  {completionSummary.isFailure && error && (
+                    <span className="completion-detail">· {error}</span>
+                  )}
+                </div>
+                <button
+                  type="button"
+                  className="btn btn-quiet btn-icon"
+                  onClick={() => {
+                    setShowCompletionBanner(false);
+                    if (completionSummary.isFailure) setError(null);
+                  }}
+                  aria-label="Dismiss completion summary"
+                >
+                  <XIcon size={15} />
+                </button>
               </div>
             )}
 
@@ -369,6 +620,8 @@ export const PhotoTranslateApp: React.FC = () => {
           </>
         )}
       </main>
+
+      <CompletionToast notice={toastNotice} onDismiss={() => setToastNotice(null)} />
     </div>
   );
 };

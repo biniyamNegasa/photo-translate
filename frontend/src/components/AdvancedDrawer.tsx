@@ -69,7 +69,9 @@ export const AdvancedDrawer: React.FC<AdvancedDrawerProps> = ({ item, onApply, o
 
       <div className="inspector-body">
         {drafts.length === 0 ? (
-          <p className="inspector-sub">No text was detected in this image.</p>
+          <p className="inspector-sub">
+            No text detected in this image. Original artwork is preserved untouched.
+          </p>
         ) : (
           drafts.map((blk, idx) => {
             const checkId = `${idPrefix}-chk-${blk.id}`;
@@ -95,7 +97,7 @@ export const AdvancedDrawer: React.FC<AdvancedDrawerProps> = ({ item, onApply, o
                 </div>
 
                 <div id={srcId} className="block-source">
-                  {blk.source_text}
+                  <bdi>{blk.source_text}</bdi>
                 </div>
 
                 <label htmlFor={textId} className="visually-hidden">
@@ -130,7 +132,7 @@ export const AdvancedDrawer: React.FC<AdvancedDrawerProps> = ({ item, onApply, o
           >
             {applying ? (
               <>
-                <LoaderIcon size={15} /> Applying changes
+                <LoaderIcon size={15} /> Applying changes…
               </>
             ) : (
               "Apply changes"
