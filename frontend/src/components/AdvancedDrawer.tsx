@@ -109,6 +109,7 @@ export const AdvancedDrawer: React.FC<AdvancedDrawerProps> = ({ item, onApply, o
                   className="block-textarea"
                   value={blk.translated_text}
                   disabled={!blk.enabled}
+                  maxLength={2000}
                   onChange={(e) => {
                     const next = [...drafts];
                     next[idx] = { ...next[idx], translated_text: e.target.value };

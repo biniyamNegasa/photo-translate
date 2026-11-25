@@ -1,5 +1,8 @@
+import threading
 from dataclasses import dataclass
 from typing import Dict, List, Optional
+
+_LANGDETECT_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -121,9 +124,10 @@ def detect_language_code(text: str, hint: Optional[str] = None) -> str:
     }
 
     try:
-        from langdetect import detect
+        with _LANGDETECT_LOCK:
+            from langdetect import detect
 
-        detected = detect(cleaned)
+            detected = detect(cleaned)
         if detected == "zh-cn":
             return "zh"
         if detected == "zh-tw":

@@ -10,6 +10,19 @@ from PIL import Image
 
 from app.config import settings
 from app.pipeline.inpainter import get_onnx_providers
+from app.pipeline.integrity import (
+    DEFAULT_MANGA_OCR_DECODER_FILENAME,
+    DEFAULT_MANGA_OCR_ENCODER_FILENAME,
+    DEFAULT_MANGA_OCR_REPO,
+    DEFAULT_MANGA_OCR_VOCAB_FILENAME,
+    DEFAULT_MANGA_OCR_VOCAB_REPO,
+    MANGA_OCR_DECODER_SHA256,
+    MANGA_OCR_ENCODER_SHA256,
+    MANGA_OCR_REVISION,
+    MANGA_OCR_VOCAB_REVISION,
+    MANGA_OCR_VOCAB_SHA256,
+    verify_file_sha256,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +125,18 @@ class MangaOCROnnx:
         with self._lock:
             if self._enc_sess is not None and self._dec_sess is not None:
                 return True
+            if self._load_failed:
+                return False
+
+            is_default_enc = (
+                settings.manga_ocr_hf_repo == DEFAULT_MANGA_OCR_REPO
+                and settings.manga_ocr_encoder_filename == DEFAULT_MANGA_OCR_ENCODER_FILENAME
+            )
+            is_default_dec = (
+                settings.manga_ocr_hf_repo == DEFAULT_MANGA_OCR_REPO
+                and settings.manga_ocr_decoder_filename == DEFAULT_MANGA_OCR_DECODER_FILENAME
+            )
+            is_default_vocab = settings.manga_ocr_vocab_repo == DEFAULT_MANGA_OCR_VOCAB_REPO
 
             if not self.is_downloaded():
                 try:
@@ -123,23 +148,55 @@ class MangaOCROnnx:
                         "Downloading quantized MangaOCR ONNX models (%s)...",
                         settings.manga_ocr_hf_repo,
                     )
-                    hf_hub_download(
-                        repo_id=settings.manga_ocr_hf_repo,
-                        filename=settings.manga_ocr_encoder_filename,
-                        local_dir=str(out_dir),
-                    )
-                    hf_hub_download(
-                        repo_id=settings.manga_ocr_hf_repo,
-                        filename=settings.manga_ocr_decoder_filename,
-                        local_dir=str(out_dir),
-                    )
-                    hf_hub_download(
-                        repo_id=settings.manga_ocr_vocab_repo,
-                        filename="vocab.txt",
-                        local_dir=str(out_dir),
-                    )
+                    enc_kwargs = {
+                        "repo_id": settings.manga_ocr_hf_repo,
+                        "filename": settings.manga_ocr_encoder_filename,
+                        "local_dir": str(out_dir),
+                    }
+                    if is_default_enc:
+                        enc_kwargs["revision"] = MANGA_OCR_REVISION
+                    hf_hub_download(**enc_kwargs)
+
+                    dec_kwargs = {
+                        "repo_id": settings.manga_ocr_hf_repo,
+                        "filename": settings.manga_ocr_decoder_filename,
+                        "local_dir": str(out_dir),
+                    }
+                    if is_default_dec:
+                        dec_kwargs["revision"] = MANGA_OCR_REVISION
+                    hf_hub_download(**dec_kwargs)
+
+                    vocab_kwargs = {
+                        "repo_id": settings.manga_ocr_vocab_repo,
+                        "filename": DEFAULT_MANGA_OCR_VOCAB_FILENAME,
+                        "local_dir": str(out_dir),
+                    }
+                    if is_default_vocab:
+                        vocab_kwargs["revision"] = MANGA_OCR_VOCAB_REVISION
+                    hf_hub_download(**vocab_kwargs)
                 except Exception as exc:
                     logger.warning("Could not download MangaOCR ONNX models (%s).", exc)
+                    self._load_failed = True
+                    return False
+
+            checks = []
+            if is_default_enc:
+                checks.append((self.encoder_path(), MANGA_OCR_ENCODER_SHA256))
+            if is_default_dec:
+                checks.append((self.decoder_path(), MANGA_OCR_DECODER_SHA256))
+            if is_default_vocab:
+                checks.append((self.vocab_path(), MANGA_OCR_VOCAB_SHA256))
+
+            for file_path, expected_sha in checks:
+                if not verify_file_sha256(file_path, expected_sha):
+                    logger.error(
+                        "MangaOCR artifact %s failed SHA-256 verification; refusing to load.",
+                        file_path.name,
+                    )
+                    try:
+                        file_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
                     self._load_failed = True
                     return False
 

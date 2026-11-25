@@ -20,6 +20,10 @@ logger = logging.getLogger(__name__)
 
 StageCallback = Callable[[ItemStatus, str], None]
 
+MAX_PIPELINE_DIMENSION = 8192
+MAX_PIPELINE_PIXELS = 25_000_000
+MAX_BLOCKS_PER_IMAGE = 150
+
 
 def _build_lines_for_comic_region(
     region: ComicRegion,
@@ -251,12 +255,23 @@ def _fill_uniform_bubble_masks(
         if m is None:
             continue
         if blk.style.uniform_bg:
-            # Clean studio-grade solid fill inside speech bubbles and solid caption bars
-            alpha = cv2.GaussianBlur(m.astype(np.float32) / 255.0, (3, 3), 0)
+            # Clean studio-grade solid fill inside speech bubbles and solid caption bars,
+            # computed strictly inside the block's padded ROI to avoid full-image float32 copies.
+            mx, my, mw, mh = cv2.boundingRect(m)
+            if mw <= 0 or mh <= 0:
+                continue
+            pad = 4
+            rx1 = max(0, mx - pad)
+            ry1 = max(0, my - pad)
+            rx2 = min(w_img, mx + mw + pad)
+            ry2 = min(h_img, my + mh + pad)
+            m_roi = m[ry1:ry2, rx1:rx2]
+            alpha = cv2.GaussianBlur(m_roi.astype(np.float32) / 255.0, (3, 3), 0)
             alpha = np.clip(alpha * 1.25, 0.0, 1.0)[..., None]
             bg_fill = np.array(blk.style.bg_color, dtype=np.float32)
-            cleaned = np.clip(
-                bg_fill * alpha + cleaned.astype(np.float32) * (1.0 - alpha),
+            roi_clean = cleaned[ry1:ry2, rx1:rx2].astype(np.float32)
+            cleaned[ry1:ry2, rx1:rx2] = np.clip(
+                bg_fill * alpha + roi_clean * (1.0 - alpha),
                 0,
                 255,
             ).astype(np.uint8)
@@ -286,6 +301,21 @@ def process_image_pipeline(
 
     Returns: (translated_rgb, inpainted_rgb, block_masks, blocks)
     """
+    if image_rgb is None or image_rgb.ndim < 2:
+        raise ValueError("Invalid input image array.")
+    h_img, w_img = image_rgb.shape[:2]
+    if (
+        h_img <= 0
+        or w_img <= 0
+        or h_img > MAX_PIPELINE_DIMENSION
+        or w_img > MAX_PIPELINE_DIMENSION
+        or (h_img * w_img) > MAX_PIPELINE_PIXELS
+    ):
+        raise ValueError(
+            f"Image dimensions ({w_img}x{h_img}) exceed maximum allowed pipeline limits "
+            f"({MAX_PIPELINE_DIMENSION}px max side, {MAX_PIPELINE_PIXELS} pixels)."
+        )
+
     if on_stage:
         on_stage(ItemStatus.DETECTING, "Detecting speech bubbles & text...")
 
@@ -296,6 +326,9 @@ def process_image_pipeline(
     )
     if not ocr_blocks:
         return image_rgb.copy(), image_rgb.copy(), {}, []
+
+    if len(ocr_blocks) > MAX_BLOCKS_PER_IMAGE:
+        ocr_blocks = sorted(ocr_blocks, key=lambda b: b.confidence, reverse=True)[:MAX_BLOCKS_PER_IMAGE]
 
     block_masks: Dict[str, np.ndarray] = {}
     blocks: List[TextBlock] = []

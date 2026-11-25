@@ -2,13 +2,16 @@
 
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
+  API_BASE,
   createTranslationJob,
   deleteJob,
+  downloadMedia,
   fetchLanguages,
   fetchSystemStatus,
   getBatchZipUrl,
   getItemDownloadUrl,
   rerenderItem,
+  sanitizeErrorMessage,
   subscribeJobEvents,
 } from "../lib/api";
 import {
@@ -37,11 +40,32 @@ import {
   XIcon,
 } from "./Icons";
 import { LanguageBar } from "./LanguageBar";
-import { UploadZone } from "./UploadZone";
+import {
+  DEFAULT_MAX_UPLOAD_FILES,
+  DEFAULT_MAX_UPLOAD_MB,
+  UploadZone,
+  validateUploadFiles,
+} from "./UploadZone";
+
+const PASTE_MIME_TO_EXT: Record<string, string> = {
+  "image/png": "png",
+  "image/jpeg": "jpg",
+  "image/webp": "webp",
+  "image/bmp": "bmp",
+};
+
+type ExtendedSystemStatus = SystemStatus & {
+  max_upload_mb?: number;
+  max_batch_images?: number;
+};
+
+function isTerminalJobStatus(status: string): boolean {
+  return status === "completed" || status === "failed" || status === "partial";
+}
 
 export const PhotoTranslateApp: React.FC = () => {
   const [languages, setLanguages] = useState<LanguageDTO[]>([]);
-  const [status, setStatus] = useState<SystemStatus | null>(null);
+  const [status, setStatus] = useState<ExtendedSystemStatus | null>(null);
 
   const [files, setFiles] = useState<File[]>([]);
   const [sourceLang, setSourceLang] = useState("auto");
@@ -54,6 +78,7 @@ export const PhotoTranslateApp: React.FC = () => {
   const [showInspector, setShowInspector] = useState(false);
 
   const [submitting, setSubmitting] = useState(false);
+  const [downloading, setDownloading] = useState<"item" | "zip" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [liveStatus, setLiveStatus] = useState<string>("");
 
@@ -65,11 +90,34 @@ export const PhotoTranslateApp: React.FC = () => {
   const [toastNotice, setToastNotice] = useState<ToastNotice | null>(null);
   const [hasUnreadCompletion, setHasUnreadCompletion] = useState(false);
 
+  const mountedRef = useRef(true);
+  const jobRequestGenRef = useRef(0);
+  const pasteSeqRef = useRef(0);
   const unsubRef = useRef<(() => void) | null>(null);
   const jobStartedAtRef = useRef<number | null>(null);
   const notifiedJobIdRef = useRef<string | null>(null);
   const alertsEnabledRef = useRef(alertsEnabled);
   alertsEnabledRef.current = alertsEnabled;
+
+  const filesRef = useRef(files);
+  filesRef.current = files;
+
+  const isBusy =
+    submitting || (job !== null && (job.status === "queued" || job.status === "processing"));
+  const pasteBlockedRef = useRef(false);
+  pasteBlockedRef.current = isBusy || job !== null;
+
+  const maxUploadFiles =
+    typeof status?.max_batch_images === "number" && status.max_batch_images > 0
+      ? Math.min(DEFAULT_MAX_UPLOAD_FILES, status.max_batch_images)
+      : DEFAULT_MAX_UPLOAD_FILES;
+  const maxUploadMb =
+    typeof status?.max_upload_mb === "number" && status.max_upload_mb > 0
+      ? status.max_upload_mb
+      : DEFAULT_MAX_UPLOAD_MB;
+
+  const limitsRef = useRef({ maxFiles: maxUploadFiles, maxUploadMb });
+  limitsRef.current = { maxFiles: maxUploadFiles, maxUploadMb };
 
   useEffect(() => {
     setNotifPermission(getNotificationPermission());
@@ -126,10 +174,12 @@ export const PhotoTranslateApp: React.FC = () => {
   }, [hasUnreadCompletion]);
 
   useEffect(() => {
+    mountedRef.current = true;
     Promise.all([fetchLanguages(), fetchSystemStatus()])
       .then(([langs, sys]) => {
+        if (!mountedRef.current) return;
         setLanguages(langs);
-        setStatus(sys);
+        setStatus(sys as ExtendedSystemStatus);
         if (langs.length > 0 && !langs.some((l) => l.code === targetLang)) {
           setTargetLang(langs[0].code);
         }
@@ -139,48 +189,84 @@ export const PhotoTranslateApp: React.FC = () => {
         }
       })
       .catch((err) => {
+        if (!mountedRef.current) return;
+        const reason = err instanceof Error ? sanitizeErrorMessage(err.message) : "";
         setError(
-          err instanceof Error
-            ? `Unable to reach the local translation server (${err.message}). Make sure the backend is running on port 8000 and refresh.`
-            : "Unable to reach the local translation server. Make sure the backend is running on port 8000 and refresh."
+          reason
+            ? `Unable to reach the local translation server (${reason}). Make sure the backend is running at ${API_BASE} and refresh.`
+            : `Unable to reach the local translation server. Make sure the backend is running at ${API_BASE} and refresh.`
         );
       });
 
     return () => {
+      mountedRef.current = false;
+      jobRequestGenRef.current += 1;
       unsubRef.current?.();
+      unsubRef.current = null;
     };
+  }, []);
+
+  const handleAddFiles = useCallback((incoming: File[]) => {
+    const { accepted, error: validationError } = validateUploadFiles(
+      filesRef.current,
+      incoming,
+      limitsRef.current
+    );
+    if (accepted.length > 0) {
+      setFiles((prev) => [...prev, ...accepted]);
+    }
+    setError(validationError);
   }, []);
 
   useEffect(() => {
     const onPaste = (e: ClipboardEvent) => {
+      if (pasteBlockedRef.current) return;
       const target = e.target as HTMLElement | null;
-      if (target && (target.tagName === "TEXTAREA" || target.tagName === "INPUT")) {
+      if (
+        target &&
+        (target.tagName === "TEXTAREA" ||
+          target.tagName === "INPUT" ||
+          target.isContentEditable)
+      ) {
         return;
       }
       const items = e.clipboardData?.items;
       if (!items) return;
+
       const pasted: File[] = [];
+      let rejectedUnsupported = false;
+      const now = Date.now();
+
       for (const item of Array.from(items)) {
-        if (item.type.startsWith("image/")) {
-          const blob = item.getAsFile();
-          if (blob) {
-            const ext = item.type.split("/")[1] || "png";
-            pasted.push(new File([blob], `pasted-${Date.now()}.${ext}`, { type: item.type }));
+        const mime = (item.type || "").toLowerCase();
+        const ext = PASTE_MIME_TO_EXT[mime];
+        if (!ext) {
+          if (mime.startsWith("image/")) {
+            rejectedUnsupported = true;
           }
+          continue;
+        }
+        const blob = item.getAsFile();
+        if (blob && blob.size > 0) {
+          pasteSeqRef.current += 1;
+          const rand = Math.random().toString(36).slice(2, 6);
+          pasted.push(
+            new File([blob], `pasted-${now}-${pasteSeqRef.current}-${rand}.${ext}`, {
+              type: mime,
+            })
+          );
         }
       }
+
       if (pasted.length > 0) {
-        setFiles((prev) => [...prev, ...pasted]);
+        handleAddFiles(pasted);
+      } else if (rejectedUnsupported) {
+        setError("Unsupported clipboard image format (allowed: PNG, JPG, WebP, BMP).");
       }
     };
     window.addEventListener("paste", onPaste);
     return () => window.removeEventListener("paste", onPaste);
-  }, []);
-
-  const handleAddFiles = useCallback((incoming: File[]) => {
-    setError(null);
-    setFiles((prev) => [...prev, ...incoming]);
-  }, []);
+  }, [handleAddFiles]);
 
   const handleRemoveFile = useCallback((index: number) => {
     setFiles((prev) => prev.filter((_, i) => i !== index));
@@ -196,14 +282,14 @@ export const PhotoTranslateApp: React.FC = () => {
       }
       if (getNotificationPermission() === "default") {
         const perm = await requestBrowserNotificationPermission();
-        setNotifPermission(perm);
+        if (mountedRef.current) setNotifPermission(perm);
       }
       return;
     }
 
     if (notifPermission === "default") {
       const perm = await requestBrowserNotificationPermission();
-      setNotifPermission(perm);
+      if (mountedRef.current) setNotifPermission(perm);
       return;
     }
 
@@ -253,6 +339,8 @@ export const PhotoTranslateApp: React.FC = () => {
 
   const handleTranslate = async () => {
     if (files.length === 0) return;
+    const reqGen = ++jobRequestGenRef.current;
+
     setError(null);
     setLiveStatus("");
     setToastNotice(null);
@@ -263,11 +351,14 @@ export const PhotoTranslateApp: React.FC = () => {
     jobStartedAtRef.current = Date.now();
     setSubmitting(true);
     unsubRef.current?.();
+    unsubRef.current = null;
 
     // Request browser notification permission inside this direct user click gesture if not yet decided
     if (alertsEnabled && getNotificationPermission() === "default") {
       requestBrowserNotificationPermission()
-        .then(setNotifPermission)
+        .then((perm) => {
+          if (mountedRef.current) setNotifPermission(perm);
+        })
         .catch(() => {});
     }
 
@@ -278,44 +369,84 @@ export const PhotoTranslateApp: React.FC = () => {
         targetLang,
         translator,
       });
+
+      if (!mountedRef.current || jobRequestGenRef.current !== reqGen) {
+        return;
+      }
+
       setJob(created);
       setSelectedItemId(created.items[0]?.item_id || "");
       setShowInspector(false);
       setViewMode("split");
 
-      unsubRef.current = subscribeJobEvents(
+      if (isTerminalJobStatus(created.status)) {
+        setSubmitting(false);
+        notifyJobFinished(created);
+        return;
+      }
+
+      const unsub = subscribeJobEvents(
         created.job_id,
         (updated) => {
+          if (!mountedRef.current || jobRequestGenRef.current !== reqGen) {
+            unsub();
+            return;
+          }
           setJob(updated);
-          if (updated.status === "completed" || updated.status === "failed") {
+          if (isTerminalJobStatus(updated.status)) {
             setSubmitting(false);
             const firstErr = updated.items.find((it) => it.error)?.error;
             if (updated.status === "failed" && firstErr) {
-              setError(firstErr);
+              setError(sanitizeErrorMessage(firstErr));
             }
             notifyJobFinished(updated);
-            fetchSystemStatus().then(setStatus).catch(() => {});
+            fetchSystemStatus()
+              .then((sys) => {
+                if (mountedRef.current) setStatus(sys as ExtendedSystemStatus);
+              })
+              .catch(() => {});
           }
         },
         () => {
+          if (!mountedRef.current || jobRequestGenRef.current !== reqGen) {
+            return;
+          }
           setSubmitting(false);
-          fetchSystemStatus().then(setStatus).catch(() => {});
+          fetchSystemStatus()
+            .then((sys) => {
+              if (mountedRef.current) setStatus(sys as ExtendedSystemStatus);
+            })
+            .catch(() => {});
         },
-        () => {
+        (streamErr) => {
+          if (!mountedRef.current || jobRequestGenRef.current !== reqGen) {
+            return;
+          }
           setSubmitting(false);
+          setError(sanitizeErrorMessage(streamErr.message, "Translation stream interrupted."));
         }
       );
+
+      if (!mountedRef.current || jobRequestGenRef.current !== reqGen) {
+        unsub();
+        return;
+      }
+      unsubRef.current = unsub;
     } catch (err) {
+      if (!mountedRef.current || jobRequestGenRef.current !== reqGen) return;
       setSubmitting(false);
-      setError(err instanceof Error ? err.message : "Translation failed.");
+      setError(
+        err instanceof Error ? sanitizeErrorMessage(err.message, "Translation failed.") : "Translation failed."
+      );
     }
   };
 
   const handleStartOver = async () => {
+    jobRequestGenRef.current += 1;
     unsubRef.current?.();
-    if (job) {
-      deleteJob(job.job_id).catch(() => {});
-    }
+    unsubRef.current = null;
+
+    const jobIdToDelete = job?.job_id;
     setJob(null);
     setSelectedItemId("");
     setFiles([]);
@@ -329,6 +460,17 @@ export const PhotoTranslateApp: React.FC = () => {
     setHasUnreadCompletion(false);
     notifiedJobIdRef.current = null;
     jobStartedAtRef.current = null;
+
+    if (jobIdToDelete) {
+      try {
+        await deleteJob(jobIdToDelete);
+      } catch (err) {
+        if (mountedRef.current) {
+          const msg = err instanceof Error ? sanitizeErrorMessage(err.message) : "";
+          console.warn("Failed to delete previous job:", msg || err);
+        }
+      }
+    }
   };
 
   const handleApplyChanges = async (updates: BlockUpdate[]) => {
@@ -336,6 +478,7 @@ export const PhotoTranslateApp: React.FC = () => {
     setError(null);
     try {
       const updatedItem = await rerenderItem(job.job_id, selectedItemId, updates);
+      if (!mountedRef.current) return;
       setJob((prev) => {
         if (!prev) return prev;
         return {
@@ -345,11 +488,53 @@ export const PhotoTranslateApp: React.FC = () => {
       });
       setLiveStatus(`Applied changes to ${updatedItem.filename}.`);
     } catch (err) {
+      if (!mountedRef.current) return;
+      const reason = err instanceof Error ? sanitizeErrorMessage(err.message) : "";
       setError(
-        err instanceof Error
-          ? `Unable to update the image (${err.message}). Check that the local server is running and try again.`
-          : "Unable to update the image. Check that the local server is running and try again."
+        reason
+          ? `Unable to update the image (${reason}). Check that the backend at ${API_BASE} is running and try again.`
+          : `Unable to update the image. Check that the backend at ${API_BASE} is running and try again.`
       );
+    }
+  };
+
+  const handleDownloadItem = async () => {
+    if (!job || !activeItem || downloading !== null) return;
+    setError(null);
+    setDownloading("item");
+    try {
+      const url = getItemDownloadUrl(job.job_id, activeItem.item_id);
+      await downloadMedia(url, `translated_${activeItem.filename}`);
+    } catch (err) {
+      if (mountedRef.current) {
+        setError(
+          err instanceof Error
+            ? sanitizeErrorMessage(err.message, "Failed to download image.")
+            : "Failed to download image."
+        );
+      }
+    } finally {
+      if (mountedRef.current) setDownloading(null);
+    }
+  };
+
+  const handleDownloadAll = async () => {
+    if (!job || downloading !== null) return;
+    setError(null);
+    setDownloading("zip");
+    try {
+      const url = getBatchZipUrl(job.job_id);
+      await downloadMedia(url, `photo-translate-${job.job_id}.zip`);
+    } catch (err) {
+      if (mountedRef.current) {
+        setError(
+          err instanceof Error
+            ? sanitizeErrorMessage(err.message, "Failed to download archive.")
+            : "Failed to download archive."
+        );
+      }
+    } finally {
+      if (mountedRef.current) setDownloading(null);
     }
   };
 
@@ -367,7 +552,7 @@ export const PhotoTranslateApp: React.FC = () => {
       ).length
     : 0;
   const completionSummary =
-    job && (job.status === "completed" || job.status === "failed")
+    job && isTerminalJobStatus(job.status)
       ? summarizeJobCompletion(job, jobElapsedMs)
       : null;
 
@@ -379,9 +564,8 @@ export const PhotoTranslateApp: React.FC = () => {
         ? "Notify when done"
         : "Chime on";
 
-  const activeIndex = job && activeItem
-    ? job.items.findIndex((it) => it.item_id === activeItem.item_id)
-    : -1;
+  const activeIndex =
+    job && activeItem ? job.items.findIndex((it) => it.item_id === activeItem.item_id) : -1;
 
   return (
     <div className="studio-shell">
@@ -469,22 +653,24 @@ export const PhotoTranslateApp: React.FC = () => {
                   <SlidersIcon size={14} /> Edit text
                 </button>
 
-                <a
-                  href={getItemDownloadUrl(job.job_id, activeItem.item_id)}
-                  download={`translated_${activeItem.filename}`}
+                <button
+                  type="button"
                   className="btn btn-primary"
+                  onClick={handleDownloadItem}
+                  disabled={downloading !== null}
                 >
-                  <DownloadIcon size={14} /> Save image
-                </a>
+                  <DownloadIcon size={14} /> {downloading === "item" ? "Saving…" : "Save image"}
+                </button>
 
                 {job.total_items > 1 && (
-                  <a
-                    href={getBatchZipUrl(job.job_id)}
-                    download={`photo-translate-${job.job_id}.zip`}
+                  <button
+                    type="button"
                     className="btn"
+                    onClick={handleDownloadAll}
+                    disabled={downloading !== null}
                   >
-                    <ArchiveIcon size={14} /> Save all
-                  </a>
+                    <ArchiveIcon size={14} /> {downloading === "zip" ? "Saving…" : "Save all"}
+                  </button>
                 )}
               </>
             )
@@ -520,8 +706,14 @@ export const PhotoTranslateApp: React.FC = () => {
             files={files}
             onAddFiles={handleAddFiles}
             onRemoveFile={handleRemoveFile}
-            onClear={() => setFiles([])}
+            onClear={() => {
+              setFiles([]);
+              setError(null);
+            }}
             onTranslate={handleTranslate}
+            onValidationError={setError}
+            maxFiles={maxUploadFiles}
+            maxUploadMb={maxUploadMb}
             submitting={submitting}
           />
         ) : (

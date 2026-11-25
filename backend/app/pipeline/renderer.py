@@ -9,6 +9,34 @@ from app.languages import detect_script, get_language
 from app.pipeline.fonts import FontEntry, is_raqm_available, load_font_chain, split_font_runs
 from app.schemas import TextBlock
 
+MAX_RENDER_CHARS = 2000
+MAX_RENDER_LINES = 40
+MAX_RENDER_PAD = 128
+
+
+def _sanitize_render_text(text: str) -> str:
+    """
+    Defensively strip C0 control characters (except newline/tab), DEL, and Unicode BiDi
+    override/isolate controls, and enforce strict character and line limits before layout/rendering.
+    """
+    if not text:
+        return ""
+    cleaned_chars: List[str] = []
+    for ch in text:
+        cp = ord(ch)
+        if (cp < 0x20 and ch not in ("\n", "\t")) or cp == 0x7F:
+            continue
+        if (0x202A <= cp <= 0x202E) or (0x2066 <= cp <= 0x2069):
+            continue
+        cleaned_chars.append(ch)
+        if len(cleaned_chars) >= MAX_RENDER_CHARS:
+            break
+    cleaned = "".join(cleaned_chars)
+    lines = cleaned.splitlines()
+    if len(lines) > MAX_RENDER_LINES:
+        cleaned = "\n".join(lines[:MAX_RENDER_LINES])
+    return cleaned.strip()
+
 
 def _luminance(rgb: Tuple[int, int, int]) -> float:
     return 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]
@@ -170,20 +198,24 @@ def _wrap_balanced_words(
     if full_w <= max_width:
         return [full_line]
 
-    # Limit DP complexity for very long paragraphs (>36 words) with greedy fallback
+    # Limit DP complexity for very long paragraphs (>36 words) with binary-search greedy fallback
     if n > 36:
         lines: List[str] = []
-        current = ""
-        for word in words:
-            trial = f"{current} {word}".strip() if current else word
-            w, _ = _measure_runs(draw, trial, font_chain, stroke_width, direction)
-            if w <= max_width or not current:
-                current = trial
-            else:
-                lines.append(current)
-                current = word
-        if current:
-            lines.append(current)
+        pos = 0
+        while pos < n:
+            lo = 1
+            hi = n - pos
+            best = 1
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                w, _ = _measure_runs(draw, " ".join(words[pos : pos + mid]), font_chain, stroke_width, direction)
+                if w <= max_width:
+                    best = mid
+                    lo = mid + 1
+                else:
+                    hi = mid - 1
+            lines.append(" ".join(words[pos : pos + best]))
+            pos += best
         return lines
 
     # DP over word indices: dp[i] = (min_cost, next_break_idx)
@@ -221,6 +253,41 @@ def _wrap_balanced_words(
     return result
 
 
+def _wrap_char_level(
+    draw: ImageDraw.ImageDraw,
+    para: str,
+    font_chain: List[FontEntry],
+    max_width: int,
+    stroke_width: int,
+    direction: str | None,
+) -> List[str]:
+    """Wrap character-based scripts (CJK/Thai) using binary search per line for O(lines * log L) time."""
+    if not para:
+        return []
+    full_w, _ = _measure_runs(draw, para, font_chain, stroke_width, direction)
+    if full_w <= max_width:
+        return [para]
+
+    lines: List[str] = []
+    pos = 0
+    n = len(para)
+    while pos < n:
+        lo = 1
+        hi = n - pos
+        best = 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            w, _ = _measure_runs(draw, para[pos : pos + mid], font_chain, stroke_width, direction)
+            if w <= max_width:
+                best = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        lines.append(para[pos : pos + best])
+        pos += best
+    return lines
+
+
 def _wrap_text(
     draw: ImageDraw.ImageDraw,
     text: str,
@@ -240,17 +307,7 @@ def _wrap_text(
             continue
 
         if char_wrap:
-            current = ""
-            for ch in para:
-                trial = current + ch
-                w, _ = _measure_runs(draw, trial, font_chain, stroke_width, direction)
-                if w <= max_width or not current:
-                    current = trial
-                else:
-                    lines.append(current)
-                    current = ch
-            if current:
-                lines.append(current)
+            lines.extend(_wrap_char_level(draw, para, font_chain, max_width, stroke_width, direction))
         else:
             words = [w for w in para.split(" ") if w]
             lines.extend(_wrap_balanced_words(draw, words, font_chain, max_width, stroke_width, direction))
@@ -363,7 +420,7 @@ def composite_and_render(
     for blk in blocks:
         if not blk.enabled:
             continue
-        raw_text = _normalize_script_punctuation(blk.translated_text.strip(), target_lang)
+        raw_text = _normalize_script_punctuation(_sanitize_render_text(blk.translated_text), target_lang)
         if not raw_text:
             continue
 
@@ -386,7 +443,7 @@ def composite_and_render(
         else:
             tx1, ty1, tx2, ty2 = x1, y1, x2, y2
 
-        # Oriented dimensions if rotated
+        # Oriented dimensions if rotated (clamped strictly to image dimensions)
         angle = style.angle
         if abs(angle) >= 2.5 and len(blk.polygon) >= 4:
             pts = blk.polygon
@@ -396,10 +453,12 @@ def composite_and_render(
             cy = sum(p[1] for p in pts) / len(pts)
         else:
             angle = 0.0
-            box_w = max(16, tx2 - tx1)
-            box_h = max(14, ty2 - ty1)
+            box_w = tx2 - tx1
+            box_h = ty2 - ty1
             cx = (tx1 + tx2) / 2.0
             cy = (ty1 + ty2) / 2.0
+        box_w = max(16, min(box_w, w_img))
+        box_h = max(16, min(box_h, h_img))
 
         fg_color = tuple(style.fg_color)
         stroke_color = tuple(style.stroke_color)
@@ -426,9 +485,10 @@ def composite_and_render(
             stroke_color = (0, 0, 0) if _luminance(fg_color) > 128 else (255, 255, 255)
             stroke_ratio = 0.055
 
-        pad = max(24, int(max(box_w, box_h) * 0.25))
-        patch_w = box_w + pad * 2
-        patch_h = box_h + pad * 2
+        pad_x = min(MAX_RENDER_PAD, max(24, int(box_w * 0.25)))
+        pad_y = min(MAX_RENDER_PAD, max(24, int(box_h * 0.25)))
+        patch_w = box_w + pad_x * 2
+        patch_h = box_h + pad_y * 2
         text_layer = Image.new("RGBA", (patch_w, patch_h), (0, 0, 0, 0))
         draw = ImageDraw.Draw(text_layer)
 
@@ -455,15 +515,15 @@ def composite_and_render(
         )
 
         # Sub-pixel vertical ink centering (subtract each line's actual ink_top!)
-        cur_ink_y = pad + (box_h - total_ink_h) / 2.0
+        cur_ink_y = pad_y + (box_h - total_ink_h) / 2.0
 
         for ln, (ink_l, ink_t, ink_w, ink_h) in zip(lines, line_inks):
             if style.alignment == "left" and not lang_info.rtl:
-                target_ink_x = float(pad)
+                target_ink_x = float(pad_x)
             elif style.alignment == "right" or (style.alignment == "left" and lang_info.rtl):
-                target_ink_x = pad + max(0.0, box_w - ink_w)
+                target_ink_x = pad_x + max(0.0, box_w - ink_w)
             else:
-                target_ink_x = pad + (box_w - ink_w) / 2.0
+                target_ink_x = pad_x + (box_w - ink_w) / 2.0
 
             draw_x = target_ink_x - ink_l
             draw_y = cur_ink_y - ink_t

@@ -83,11 +83,8 @@ export interface TranslatorInfo {
 }
 
 export interface SystemStatus {
-  lama_downloaded: boolean;
-  comic_detector_downloaded?: boolean;
-  manga_ocr_downloaded?: boolean;
-  raqm_available: boolean;
-  device: string;
+  max_upload_mb: number;
+  max_batch_images: number;
   translators: TranslatorInfo[];
 }
 

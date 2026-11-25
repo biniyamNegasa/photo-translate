@@ -11,6 +11,8 @@ from app.languages import detect_script
 
 logger = logging.getLogger(__name__)
 
+MAX_OCR_LINES = 400
+
 
 @dataclass
 class OCRLine:
@@ -45,6 +47,7 @@ class OCREngine:
     def __init__(self) -> None:
         self._engine = None
         self._lock = threading.Lock()
+        self._infer_lock = threading.Lock()
 
     def _ensure_loaded(self) -> None:
         if self._engine is not None:
@@ -65,7 +68,8 @@ class OCREngine:
         conf_threshold = min_confidence if min_confidence is not None else settings.ocr_min_confidence
 
         image_bgr = image_rgb[:, :, ::-1].copy()
-        result, _ = self._engine(image_bgr)
+        with self._infer_lock:
+            result, _ = self._engine(image_bgr)
         if not result:
             return []
 
@@ -142,7 +146,8 @@ class OCREngine:
         ox, oy = offset_xy
         ch, cw = crop_rgb.shape[:2]
         crop_bgr = crop_rgb[:, :, ::-1].copy()
-        result, _ = self._engine(crop_bgr, use_det=True, use_cls=False, use_rec=True)
+        with self._infer_lock:
+            result, _ = self._engine(crop_bgr, use_det=True, use_cls=False, use_rec=True)
 
         raw_lines: List[OCRLine] = []
         if result:
@@ -194,7 +199,8 @@ class OCREngine:
         # Safety net: recognition-only pass for tight single-line bubbles where det missed
         if cw >= bh_min(ch) and ch <= cw * 1.2:
             try:
-                rec_res, _ = self._engine(crop_bgr, use_det=False, use_cls=False, use_rec=True)
+                with self._infer_lock:
+                    rec_res, _ = self._engine(crop_bgr, use_det=False, use_cls=False, use_rec=True)
                 if rec_res:
                     txt, sc = str(rec_res[0][0]).strip(), float(rec_res[0][1])
                     if txt and sc >= min_confidence:
@@ -267,7 +273,8 @@ class OCREngine:
 
             crop_bgr = image_rgb[cy1:cy2, cx1:cx2, ::-1].copy()
             try:
-                rec_res, _ = self._engine(crop_bgr, use_det=False, use_cls=False, use_rec=True)
+                with self._infer_lock:
+                    rec_res, _ = self._engine(crop_bgr, use_det=False, use_cls=False, use_rec=True)
             except Exception:
                 continue
             if not rec_res:
@@ -434,6 +441,9 @@ def _infer_alignment(lines: List[OCRLine], block_bbox: Tuple[int, int, int, int]
 def group_ocr_lines(lines: List[OCRLine]) -> List[OCRBlock]:
     if not lines:
         return []
+
+    if len(lines) > MAX_OCR_LINES:
+        lines = sorted(lines, key=lambda l: l.confidence, reverse=True)[:MAX_OCR_LINES]
 
     n = len(lines)
     parent = list(range(n))

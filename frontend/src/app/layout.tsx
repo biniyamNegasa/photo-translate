@@ -18,6 +18,7 @@ export default function RootLayout({ children }: LayoutProps) {
         <meta charSet="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <meta name="color-scheme" content="light dark" />
+        <meta name="referrer" content="no-referrer" />
       </head>
       <body>{children}</body>
     </html>

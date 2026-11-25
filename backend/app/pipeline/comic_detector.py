@@ -8,10 +8,18 @@ import cv2
 import numpy as np
 
 from app.config import settings
+from app.pipeline.integrity import (
+    COMIC_DETECTOR_REVISION,
+    COMIC_DETECTOR_SHA256,
+    DEFAULT_COMIC_DETECTOR_FILENAME,
+    DEFAULT_COMIC_DETECTOR_REPO,
+    verify_file_sha256,
+)
 
 logger = logging.getLogger(__name__)
 
 INPUT_SIZE = 1024
+MAX_COMIC_REGIONS = 150
 
 
 @dataclass
@@ -203,13 +211,15 @@ def postprocess_comic_outputs(
             ux, uy, uw, uh, _ = u_stats[uid]
             if uw < 20 or uh < 18:
                 continue
-            comp_mask = (u_labels == uid) & (uncovered_seg > 0)
+            sub_labels = u_labels[uy : uy + uh, ux : ux + uw]
+            sub_uncov = uncovered_seg[uy : uy + uh, ux : ux + uw]
+            comp_mask = (sub_labels == uid) & (sub_uncov > 0)
             raw_px = int(np.count_nonzero(comp_mask))
             if raw_px < min_uncov_px or raw_px > max_uncov_px:
                 continue
             ys_u, xs_u = np.where(comp_mask)
-            tx1, ty1 = int(xs_u.min()), int(ys_u.min())
-            tx2, ty2 = int(xs_u.max()) + 1, int(ys_u.max()) + 1
+            tx1, ty1 = int(ux + xs_u.min()), int(uy + ys_u.min())
+            tx2, ty2 = int(ux + xs_u.max()) + 1, int(uy + ys_u.max()) + 1
             bw_u, bh_u = tx2 - tx1, ty2 - ty1
             if bw_u < 20 or bh_u < 18:
                 continue
@@ -222,18 +232,29 @@ def postprocess_comic_outputs(
     if not merged_boxes:
         return []
 
-    regions: List[ComicRegion] = []
+    # Verify each candidate contains learned text probability and cap total regions
+    # BEFORE allocating per-region full-image masks.
+    verified_boxes: List[Tuple[int, int, int, int, float]] = []
     for bx1, by1, bx2, by2, conf in merged_boxes:
-        bw = max(1, bx2 - bx1)
-        bh = max(1, by2 - by1)
-
-        # Verify the region actually contains learned text probability (filters artwork false positives)
         seg_slice = seg_prob[by1:by2, bx1:bx2]
         det_slice = det_prob[by1:by2, bx1:bx2]
         if (seg_slice.size == 0 or float(seg_slice.max()) < 0.25) and (
             det_slice.size == 0 or float(det_slice.max()) < 0.25
         ):
             continue
+        verified_boxes.append((bx1, by1, bx2, by2, conf))
+
+    if not verified_boxes:
+        return []
+
+    if len(verified_boxes) > MAX_COMIC_REGIONS:
+        verified_boxes.sort(key=lambda b: b[4], reverse=True)
+        verified_boxes = verified_boxes[:MAX_COMIC_REGIONS]
+
+    regions: List[ComicRegion] = []
+    for bx1, by1, bx2, by2, conf in verified_boxes:
+        bw = max(1, bx2 - bx1)
+        bh = max(1, by2 - by1)
 
         # Collect DBNet line contours belonging to this speech bubble
         inside_lines: List[Tuple[int, int, int, int]] = []
@@ -323,6 +344,16 @@ class ComicTextDetector:
         with self._lock:
             if self._net is not None:
                 return True
+            if self._load_failed:
+                return False
+
+            is_default = (
+                settings.comic_detector_hf_repo == DEFAULT_COMIC_DETECTOR_REPO
+                and settings.comic_detector_hf_filename == DEFAULT_COMIC_DETECTOR_FILENAME
+            )
+            revision = COMIC_DETECTOR_REVISION if is_default else None
+            expected_sha = COMIC_DETECTOR_SHA256 if is_default else None
+
             target = self.model_path()
             if not self.is_downloaded():
                 try:
@@ -334,15 +365,30 @@ class ComicTextDetector:
                         settings.comic_detector_hf_repo,
                         settings.comic_detector_hf_filename,
                     )
-                    hf_hub_download(
-                        repo_id=settings.comic_detector_hf_repo,
-                        filename=settings.comic_detector_hf_filename,
-                        local_dir=str(target.parent),
-                    )
+                    dl_kwargs = {
+                        "repo_id": settings.comic_detector_hf_repo,
+                        "filename": settings.comic_detector_hf_filename,
+                        "local_dir": str(target.parent),
+                    }
+                    if revision is not None:
+                        dl_kwargs["revision"] = revision
+                    hf_hub_download(**dl_kwargs)
                 except Exception as exc:
                     logger.warning("Could not download comic-text-detector ONNX (%s); falling back to RapidOCR.", exc)
                     self._load_failed = True
                     return False
+
+            if expected_sha is not None and not verify_file_sha256(target, expected_sha):
+                logger.error(
+                    "comic-text-detector ONNX %s failed SHA-256 verification; refusing to load.",
+                    target.name,
+                )
+                try:
+                    target.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                self._load_failed = True
+                return False
 
             try:
                 logger.info("Loading comic-text-detector ONNX via OpenCV DNN...")

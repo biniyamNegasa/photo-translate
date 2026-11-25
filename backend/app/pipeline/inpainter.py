@@ -8,8 +8,17 @@ import cv2
 import numpy as np
 
 from app.config import settings
+from app.pipeline.integrity import (
+    DEFAULT_LAMA_FILENAME,
+    DEFAULT_LAMA_REPO,
+    LAMA_REVISION,
+    LAMA_SHA256,
+    verify_file_sha256,
+)
 
 logger = logging.getLogger(__name__)
+
+MAX_INITIAL_CLUSTERS = 150
 
 
 def get_onnx_providers() -> List[str]:
@@ -53,6 +62,15 @@ class LamaInpainter:
         with self._lock:
             if self._session is not None:
                 return True
+            if self._load_failed:
+                return False
+
+            is_default = (
+                settings.lama_hf_repo == DEFAULT_LAMA_REPO
+                and settings.lama_hf_filename == DEFAULT_LAMA_FILENAME
+            )
+            revision = LAMA_REVISION if is_default else None
+            expected_sha = LAMA_SHA256 if is_default else None
 
             target_path = self.model_path()
             if not self.is_downloaded():
@@ -65,11 +83,14 @@ class LamaInpainter:
                         settings.lama_hf_repo,
                         settings.lama_hf_filename,
                     )
-                    downloaded = hf_hub_download(
-                        repo_id=settings.lama_hf_repo,
-                        filename=settings.lama_hf_filename,
-                        local_dir=str(target_path.parent),
-                    )
+                    dl_kwargs = {
+                        "repo_id": settings.lama_hf_repo,
+                        "filename": settings.lama_hf_filename,
+                        "local_dir": str(target_path.parent),
+                    }
+                    if revision is not None:
+                        dl_kwargs["revision"] = revision
+                    downloaded = hf_hub_download(**dl_kwargs)
                     self._model_path = Path(downloaded)
                 except Exception as exc:
                     logger.warning("Could not download LaMa ONNX model (%s); using OpenCV fallback.", exc)
@@ -77,6 +98,18 @@ class LamaInpainter:
                     return False
             else:
                 self._model_path = target_path
+
+            if expected_sha is not None and not verify_file_sha256(self._model_path, expected_sha):
+                logger.error(
+                    "LaMa ONNX model %s failed SHA-256 verification; refusing to load.",
+                    self._model_path.name,
+                )
+                try:
+                    self._model_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                self._load_failed = True
+                return False
 
             try:
                 import onnxruntime as ort
@@ -132,16 +165,36 @@ class LamaInpainter:
         merged = cv2.dilate(mask, merge_k)
         num_labels, _, stats, _ = cv2.connectedComponentsWithStats(merged, connectivity=8)
 
-        boxes: List[Tuple[int, int, int, int]] = []
+        candidates: List[Tuple[int, Tuple[int, int, int, int]]] = []
         for idx in range(1, num_labels):
             x, y, bw, bh, area = stats[idx]
             if area < 4:
                 continue
-            boxes.append((int(x), int(y), int(x + bw), int(y + bh)))
+            candidates.append((int(area), (int(x), int(y), int(x + bw), int(y + bh))))
+
+        if len(candidates) > MAX_INITIAL_CLUSTERS:
+            candidates.sort(key=lambda item: item[0], reverse=True)
+            candidates = candidates[:MAX_INITIAL_CLUSTERS]
+
+        boxes: List[Tuple[int, int, int, int]] = [box for _, box in candidates]
 
         # If the whole image is modest in size (<= 768px max side), one full-frame pass is faster and cleaner
         if max(h, w) <= 768 and len(boxes) > 0:
             return [(0, 0, w, h)]
+
+        # Collapse dense cluster sets via a 5x5 spatial grid so pairwise merging never blows up O(K^3)
+        if len(boxes) > 32:
+            grid: dict[Tuple[int, int], Tuple[int, int, int, int]] = {}
+            for x1, y1, x2, y2 in boxes:
+                gx = min(4, max(0, int(((x1 + x2) * 0.5) * 5 / max(1, w))))
+                gy = min(4, max(0, int(((y1 + y2) * 0.5) * 5 / max(1, h))))
+                key = (gx, gy)
+                if key in grid:
+                    gx1, gy1, gx2, gy2 = grid[key]
+                    grid[key] = (min(gx1, x1), min(gy1, y1), max(gx2, x2), max(gy2, y2))
+                else:
+                    grid[key] = (x1, y1, x2, y2)
+            boxes = list(grid.values())
 
         # Cap max LaMa patches per page at 5 by iteratively merging the two closest boxes
         while len(boxes) > 5:

@@ -1,6 +1,10 @@
 from enum import Enum
-from typing import List, Optional, Tuple
+from typing import Annotated, List, Literal, Optional, Tuple
+
 from pydantic import BaseModel, Field
+
+ColorChannel = Annotated[int, Field(ge=0, le=255)]
+RGBColor = Tuple[ColorChannel, ColorChannel, ColorChannel]
 
 
 class JobStatus(str, Enum):
@@ -22,15 +26,17 @@ class ItemStatus(str, Enum):
 
 
 class TextStyle(BaseModel):
-    fg_color: Tuple[int, int, int] = (255, 255, 255)
-    bg_color: Tuple[int, int, int] = (0, 0, 0)
+    fg_color: RGBColor = (255, 255, 255)
+    bg_color: RGBColor = (0, 0, 0)
     has_stroke: bool = False
-    stroke_color: Tuple[int, int, int] = (0, 0, 0)
-    stroke_width: int = 0
+    stroke_color: RGBColor = (0, 0, 0)
+    stroke_width: int = Field(0, ge=0, le=32)
     is_bold: bool = False
     is_uppercase: bool = False
-    angle: float = 0.0
-    alignment: str = "center"  # left | center | right
+    angle: float = Field(0.0, ge=-360.0, le=360.0)
+    rotation: float = Field(0.0, ge=-360.0, le=360.0)
+    font_size_hint: int = Field(24, ge=6, le=512)
+    alignment: Literal["left", "center", "right"] = "center"
     uniform_bg: bool = False
     comic_style: bool = False
 
@@ -78,13 +84,13 @@ class JobInfo(BaseModel):
 
 
 class BlockUpdateItem(BaseModel):
-    id: str
-    translated_text: Optional[str] = None
+    id: str = Field(..., min_length=1, max_length=64)
+    translated_text: Optional[str] = Field(default=None, max_length=2000)
     enabled: Optional[bool] = None
 
 
 class RerenderRequest(BaseModel):
-    blocks: List[BlockUpdateItem]
+    blocks: List[BlockUpdateItem] = Field(..., max_length=250)
 
 
 class LanguageDTO(BaseModel):
@@ -104,9 +110,6 @@ class TranslatorInfo(BaseModel):
 
 
 class SystemStatus(BaseModel):
-    lama_downloaded: bool
-    comic_detector_downloaded: bool = False
-    manga_ocr_downloaded: bool = False
-    raqm_available: bool
-    device: str
+    max_upload_mb: int
+    max_batch_images: int
     translators: List[TranslatorInfo]

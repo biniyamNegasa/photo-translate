@@ -28,6 +28,12 @@ backend/.env.*
 frontend/.env
 frontend/.env.*
 !frontend/.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.sqlite
+*.db
 
 # Local AI agent tooling
 .agents/

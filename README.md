@@ -39,6 +39,7 @@ Upload a single image, multiple pages, or a `.zip` chapter archive, pick your ta
 git clone <your-repo-url>
 cd photo-translate
 cp backend/.env.example backend/.env
+chmod 600 backend/.env
 # Edit backend/.env to add DeepSeek, Addis AI, or DeepL API keys (Google Translate works with no key).
 ```
 
@@ -74,18 +75,26 @@ See [backend/.env.example](backend/.env.example) for all options:
 
 | Variable | Default | Description |
 | --- | --- | --- |
+| `PHOTO_TRANSLATE_API_KEY` | *(empty)* | Optional API key required on backend requests (`X-API-Key` / `Authorization: Bearer`) |
+| `PHOTO_TRANSLATE_CORS_ORIGINS` | `["http://localhost:3000","http://127.0.0.1:3000"]` | Allowed browser origins for CORS |
+| `PHOTO_TRANSLATE_ENABLE_DOCS` | `false` | Expose `/docs`, `/redoc`, and `/openapi.json` |
 | `PHOTO_TRANSLATE_DEEPSEEK_API_KEY` | *(empty)* | Enables DeepSeek context-aware batch translator |
 | `PHOTO_TRANSLATE_DEEPSEEK_MODEL` | `deepseek-chat` | DeepSeek model name |
 | `PHOTO_TRANSLATE_ADDIS_API_KEY` | *(empty)* | Enables Addis AI (`am`, `om`, `ti`, `en`, `sw`, `fr`) |
 | `PHOTO_TRANSLATE_DEEPL_API_KEY` | *(empty)* | Enables DeepL API translator |
 | `PHOTO_TRANSLATE_JOB_TTL_SECONDS` | `3600` | Auto-expiry time for temporary job files |
+| `PHOTO_TRANSLATE_WORKER_CONCURRENCY` | `2` | Maximum concurrent translation jobs |
 | `PHOTO_TRANSLATE_ITEM_CONCURRENCY` | `3` | Concurrent images processed per batch job |
 | `PHOTO_TRANSLATE_BUBBLE_OCR_CONCURRENCY` | `4` | Concurrent bubble OCR workers per image |
 | `VITE_API_BASE` *(frontend)* | `http://127.0.0.1:8000` | Backend API base URL |
 
 ## Running Tests
 
+Install development/test dependencies first (`requirements-dev.txt` includes `pytest`):
+
 ```bash
+backend/.venv/bin/pip install -r backend/requirements-dev.txt
+
 # Backend unit & pipeline tests
 backend/.venv/bin/pytest backend/tests/test_pipeline.py -v
 
@@ -93,6 +102,16 @@ backend/.venv/bin/pytest backend/tests/test_pipeline.py -v
 npm --prefix frontend run type-check
 npm --prefix frontend run build
 ```
+
+## Production Deployment & Security Hardening
+
+Photo Translate defaults to a **localhost-first** workstation setup. Before exposing it on a shared network or public host, see [SECURITY.md](SECURITY.md) and apply the following hardening steps:
+
+- **Never use `--reload` or `./start-dev.sh` in production:** Run Uvicorn/Gunicorn without `--reload` and build the frontend with `npm --prefix frontend run build && npm --prefix frontend run start`.
+- **Require authentication & disable API docs:** Set a strong random `PHOTO_TRANSLATE_API_KEY` in `backend/.env` (`chmod 600 backend/.env`) and keep `PHOTO_TRANSLATE_ENABLE_DOCS=false`.
+- **Pin explicit CORS origins:** Set `PHOTO_TRANSLATE_CORS_ORIGINS` strictly to your deployed frontend origin(s); never use `*`.
+- **Place behind a TLS reverse proxy:** Terminate HTTPS at Nginx/Caddy/ALB and enforce request body limits, authentication, and per-IP rate limiting.
+- **Tighten upload & retention limits:** Lower `PHOTO_TRANSLATE_MAX_UPLOAD_MB`, `PHOTO_TRANSLATE_MAX_BATCH_IMAGES`, `PHOTO_TRANSLATE_WORKER_CONCURRENCY`, and `PHOTO_TRANSLATE_JOB_TTL_SECONDS` to match your host resources and retention policy.
 
 ## Hardware & Performance Notes
 

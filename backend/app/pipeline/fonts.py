@@ -10,8 +10,20 @@ from PIL import ImageFont, features
 
 from app.config import settings
 from app.languages import detect_script, get_language
+from app.pipeline.integrity import (
+    COMIC_NEUE_SHA256,
+    download_verified_file,
+    verify_file_sha256,
+)
 
 logger = logging.getLogger(__name__)
+
+MAX_FONT_FILE_BYTES = 32 * 1024 * 1024  # 32 MiB cap for TTF/OTF cmap reads
+MAX_COMIC_FONT_BYTES = 5 * 1024 * 1024  # 5 MiB cap for auto-downloaded comic fonts
+MAX_CMAP_SUBTABLES = 32
+MAX_FORMAT4_SEGMENTS = 32768
+MAX_FORMAT12_GROUPS = 200_000
+MAX_UNICODES = 0x110000
 
 COMIC_FONT_URLS = {
     "ComicNeue-Bold.ttf": "https://raw.githubusercontent.com/google/fonts/main/ofl/comicneue/ComicNeue-Bold.ttf",
@@ -58,9 +70,9 @@ def is_raqm_available() -> bool:
 
 def _parse_cmap_from_sfnt(data: bytes, sfnt_offset: int) -> FrozenSet[int]:
     """Extract all Unicode codepoints mapped in a TTF/OTF sfnt `cmap` table (formats 4 and 12)."""
-    if sfnt_offset + 12 > len(data):
+    if sfnt_offset < 0 or sfnt_offset + 12 > len(data):
         return frozenset()
-    num_tables = struct.unpack_from(">H", data, sfnt_offset + 4)[0]
+    num_tables = min(struct.unpack_from(">H", data, sfnt_offset + 4)[0], 256)
     cmap_offset = None
     for i in range(num_tables):
         entry_off = sfnt_offset + 12 + i * 16
@@ -74,8 +86,9 @@ def _parse_cmap_from_sfnt(data: bytes, sfnt_offset: int) -> FrozenSet[int]:
     if cmap_offset is None or cmap_offset + 4 > len(data):
         return frozenset()
 
-    num_subtables = struct.unpack_from(">H", data, cmap_offset + 2)[0]
+    num_subtables = min(struct.unpack_from(">H", data, cmap_offset + 2)[0], MAX_CMAP_SUBTABLES)
     codepoints: set[int] = set()
+    seen_sub_offsets: set[int] = set()
 
     for i in range(num_subtables):
         rec_off = cmap_offset + 4 + i * 8
@@ -86,27 +99,40 @@ def _parse_cmap_from_sfnt(data: bytes, sfnt_offset: int) -> FrozenSet[int]:
         if not (platform_id == 0 or (platform_id == 3 and encoding_id in (1, 10))):
             continue
         sub_off = cmap_offset + sub_rel
+        if sub_off in seen_sub_offsets:
+            continue
+        seen_sub_offsets.add(sub_off)
         if sub_off + 2 > len(data):
             continue
         fmt = struct.unpack_from(">H", data, sub_off)[0]
 
         if fmt == 4 and sub_off + 14 <= len(data):
             seg_count_x2 = struct.unpack_from(">H", data, sub_off + 6)[0]
+            if seg_count_x2 == 0 or (seg_count_x2 % 2) != 0:
+                continue
             seg_count = seg_count_x2 // 2
+            if seg_count > MAX_FORMAT4_SEGMENTS:
+                continue
             end_codes_off = sub_off + 14
             start_codes_off = end_codes_off + seg_count_x2 + 2
             id_delta_off = start_codes_off + seg_count_x2
             id_range_off = id_delta_off + seg_count_x2
             if id_range_off + seg_count_x2 > len(data):
                 continue
+            prev_end = -1
             for s in range(seg_count):
                 end_code = struct.unpack_from(">H", data, end_codes_off + s * 2)[0]
                 start_code = struct.unpack_from(">H", data, start_codes_off + s * 2)[0]
                 if start_code == 0xFFFF and end_code == 0xFFFF:
-                    continue
+                    break
+                if not (prev_end < start_code <= end_code <= 0xFFFF):
+                    break
+                prev_end = end_code
                 id_delta = struct.unpack_from(">h", data, id_delta_off + s * 2)[0]
                 range_val = struct.unpack_from(">H", data, id_range_off + s * 2)[0]
                 for cp in range(start_code, end_code + 1):
+                    if len(codepoints) >= MAX_UNICODES:
+                        return frozenset(codepoints)
                     if range_val == 0:
                         glyph_id = (cp + id_delta) & 0xFFFF
                     else:
@@ -119,18 +145,28 @@ def _parse_cmap_from_sfnt(data: bytes, sfnt_offset: int) -> FrozenSet[int]:
                         codepoints.add(cp)
 
         elif fmt == 12 and sub_off + 16 <= len(data):
-            num_groups = struct.unpack_from(">I", data, sub_off + 12)[0]
+            num_groups = min(struct.unpack_from(">I", data, sub_off + 12)[0], MAX_FORMAT12_GROUPS)
             grp_off = sub_off + 16
+            prev_end = -1
             for g in range(num_groups):
                 off = grp_off + g * 12
                 if off + 12 > len(data):
                     break
                 start_cp, end_cp, start_gid = struct.unpack_from(">III", data, off)
+                if not (0 <= start_cp <= end_cp <= 0x10FFFF) or start_cp <= prev_end:
+                    break
+                prev_end = end_cp
                 if start_gid == 0 and start_cp == end_cp:
                     continue
-                # Guard against corrupt huge ranges
                 if end_cp - start_cp <= 65536:
-                    codepoints.update(range(start_cp, end_cp + 1))
+                    remaining = MAX_UNICODES - len(codepoints)
+                    if remaining <= 0:
+                        return frozenset(codepoints)
+                    if (end_cp - start_cp + 1) <= remaining:
+                        codepoints.update(range(start_cp, end_cp + 1))
+                    else:
+                        codepoints.update(range(start_cp, start_cp + remaining))
+                        return frozenset(codepoints)
 
     return frozenset(codepoints)
 
@@ -141,7 +177,11 @@ def get_font_codepoints(font_path: str) -> FrozenSet[int]:
     if not font_path:
         return frozenset()
     try:
-        data = Path(font_path).read_bytes()
+        p = Path(font_path)
+        st = p.stat()
+        if st.st_size < 12 or st.st_size > MAX_FONT_FILE_BYTES:
+            return frozenset()
+        data = p.read_bytes()
         if len(data) < 12:
             return frozenset()
         if data[:4] == b"ttcf":
@@ -161,7 +201,7 @@ def get_font_codepoints(font_path: str) -> FrozenSet[int]:
 def _fc_match(pattern: str) -> Optional[str]:
     try:
         out = subprocess.check_output(
-            ["fc-match", "-f", "%{file}", pattern],
+            ["fc-match", "-f", "%{file}", "--", pattern],
             stderr=subprocess.DEVNULL,
             text=True,
             timeout=3,
@@ -176,32 +216,42 @@ def _fc_match(pattern: str) -> Optional[str]:
 def _resolve_comic_font_path(bold: bool = True) -> Optional[str]:
     """
     Resolve cached open-source comic lettering font (`ComicNeue-Bold.ttf` / `ComicNeue-Regular.ttf`).
-    Attempts a one-time silent download into `settings.fonts_dir` if missing; falls back cleanly if offline.
+    Verifies SHA-256 on cached and downloaded fonts; falls back cleanly if offline or tampered.
     """
     fname = "ComicNeue-Bold.ttf" if bold else "ComicNeue-Regular.ttf"
+    expected_sha = COMIC_NEUE_SHA256.get(fname)
+    if not expected_sha:
+        return None
     target = settings.fonts_dir / fname
-    if target.is_file() and target.stat().st_size > 10_000:
-        return str(target)
 
-    if fname not in _COMIC_FONT_DOWNLOAD_ATTEMPTED:
-        with _COMIC_FONT_LOCK:
-            if target.is_file() and target.stat().st_size > 10_000:
+    with _COMIC_FONT_LOCK:
+        if target.is_file():
+            if verify_file_sha256(target, expected_sha):
                 return str(target)
-            if fname not in _COMIC_FONT_DOWNLOAD_ATTEMPTED:
-                _COMIC_FONT_DOWNLOAD_ATTEMPTED.add(fname)
-                url = COMIC_FONT_URLS.get(fname)
-                if url:
-                    try:
-                        import httpx
+            logger.error("Cached comic font %s failed SHA-256 verification; refusing to load.", fname)
+            try:
+                target.unlink(missing_ok=True)
+            except OSError:
+                pass
+            _COMIC_FONT_DOWNLOAD_ATTEMPTED.add(fname)
+            return None
 
-                        settings.fonts_dir.mkdir(parents=True, exist_ok=True)
-                        resp = httpx.get(url, follow_redirects=True, timeout=8.0)
-                        resp.raise_for_status()
-                        if len(resp.content) > 10_000:
-                            target.write_bytes(resp.content)
-                            return str(target)
-                    except Exception as exc:
-                        logger.debug("Could not auto-download comic font %s (%s); using Noto Sans.", fname, exc)
+        if fname not in _COMIC_FONT_DOWNLOAD_ATTEMPTED:
+            url = COMIC_FONT_URLS.get(fname)
+            try:
+                if url:
+                    download_verified_file(
+                        url=url,
+                        target_path=target,
+                        expected_sha256=expected_sha,
+                        max_bytes=MAX_COMIC_FONT_BYTES,
+                        timeout=8.0,
+                    )
+                    return str(target)
+            except Exception as exc:
+                logger.debug("Could not auto-download verified comic font %s (%s); using Noto Sans.", fname, exc)
+            finally:
+                _COMIC_FONT_DOWNLOAD_ATTEMPTED.add(fname)
     return None
 
 
@@ -283,12 +333,21 @@ def resolve_font_path(
     return ""
 
 
+@functools.lru_cache(maxsize=256)
+def _load_truetype_cached(
+    font_path: str,
+    size: int,
+    use_raqm: bool,
+) -> ImageFont.FreeTypeFont:
+    layout_engine = ImageFont.Layout.RAQM if use_raqm else ImageFont.Layout.BASIC
+    return ImageFont.truetype(font_path, size=size, layout_engine=layout_engine)
+
+
 def _open_font(font_path: str, size: int) -> Optional[ImageFont.FreeTypeFont]:
     if not font_path:
         return None
-    layout_engine = ImageFont.Layout.RAQM if is_raqm_available() else ImageFont.Layout.BASIC
     try:
-        return ImageFont.truetype(font_path, size=max(size, 6), layout_engine=layout_engine)
+        return _load_truetype_cached(font_path, max(size, 6), is_raqm_available())
     except Exception as exc:
         logger.warning("Failed loading font %s: %s", font_path, exc)
         return None

@@ -128,7 +128,7 @@ def extract_block_mask_and_style(
     min_line_h = max(8.0, min(l.height for l in block.lines))
 
     # Generous ROI padding so thick meme strokes & drop shadows outside OCR boxes are fully visible
-    pad = max(24, int(min_line_h * 0.65))
+    pad = min(96, max(24, int(min_line_h * 0.65)))
     rx1 = max(0, x1 - pad)
     ry1 = max(0, y1 - pad)
     rx2 = min(w_img, x2 + pad)
@@ -174,8 +174,8 @@ def extract_block_mask_and_style(
 
     if len(halo_pixels) < 20:
         # Outer halo (6..16px beyond polygons — far enough outside thick meme outlines!) to sample true background
-        inner_r = max(7, int(min_line_h * 0.22) | 1)
-        outer_r = max(inner_r + 10, int(min_line_h * 0.55) | 1)
+        inner_r = min(25, max(7, int(min_line_h * 0.22) | 1))
+        outer_r = min(51, max(inner_r + 10, int(min_line_h * 0.55) | 1))
         k_inner = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (inner_r, inner_r))
         k_outer = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (outer_r, outer_r))
         halo_mask = cv2.subtract(cv2.dilate(poly_mask, k_outer), cv2.dilate(poly_mask, k_inner))
